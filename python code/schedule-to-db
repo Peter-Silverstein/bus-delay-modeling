@@ -1,0 +1,7 @@
+import os
+import pandas as pd
+import numpy as np
+import psycopg2
+
+schedule = pd.read_csv("Other Data/gtfs-static-files/stop_times.txt")
+print(schedule.head())
