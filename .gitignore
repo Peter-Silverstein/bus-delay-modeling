@@ -1,3 +1,10 @@
+# datafiles
+/Geo Files/
+/Predictor Data Sets/
+/raw_aws_alreadyloaded/
+/raw_from_awsS3/
+/sea-gtfs-proj/
+
 # History files
 .Rhistory
 .Rapp.history
@@ -47,3 +54,4 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
