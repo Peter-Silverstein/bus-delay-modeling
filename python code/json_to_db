@@ -1,0 +1,193 @@
+import os
+import pandas as pd
+import numpy as np
+import json
+import psycopg2
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+from psycopg2 import sql
+from io import StringIO
+from zoneinfo import ZoneInfo
+
+# Extract Trip Data function
+def extract_trip_data(parsed_feed):
+    trip_data = []
+    # Check if parsed_feed is a list
+    if isinstance(parsed_feed, list):
+        for item in parsed_feed:
+            # Directly access the trip data from each item
+            trip_id = item.get('trip_id', '')
+            route_id = item.get('route_id', '')
+            stop_id = item.get('stop_id', '')
+            arrival_time = item.get('arrival_time', '')
+            departure_time = item.get('departure_time', '')
+            
+            # Append relevant data as a dictionary
+            trip_data.append({
+                'trip_id': trip_id,
+                'route_id': route_id,
+                'stop_id': stop_id,
+                'arrival_time': arrival_time,
+                'departure_time': departure_time,
+            })
+    return trip_data
+
+# Function to iterate over the folder and process JSON files
+def json_to_df(folder_path):
+    all_data = []  # List to store all dataframes
+
+    # Iterate through all JSON files in the folder
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.json'): 
+            file_path = os.path.join(folder_path, filename)
+
+            # Open and load the JSON file
+            with open(file_path, 'r') as f:
+                parsed_feed = json.load(f)
+
+            # Extract trip data using the updated function
+            trip_data = extract_trip_data(parsed_feed)
+
+            # Convert to dataframe
+            df = pd.DataFrame(trip_data)
+
+            # Add a column for the source filename
+            df['source_file'] = filename
+
+            # Append to the list of dataframes
+            all_data.append(df)
+
+    # Combine all dataframes into one
+    combined_df = pd.concat(all_data, ignore_index=True)
+
+    return combined_df
+
+# Function to convert Unix time to date and seconds after midnight in PST
+def convert_to_date_and_time(unix_time):
+    if unix_time:
+        utc_time = datetime.fromtimestamp(int(unix_time), tz = timezone.utc)
+        pst_time = utc_time.astimezone(ZoneInfo("America/Los_Angeles")) # Adjust for PST (UTC-8)
+        combined_datetime = pst_time.strftime('%Y-%m-%d %H:%M:%S')
+        return combined_datetime
+    return None
+
+# Application
+local_dir = 'raw_from_awsS3'
+combined_df = json_to_df(local_dir)
+
+# Cleaning Data
+
+# Converting columns to more useful types
+combined_df = combined_df.astype({"source_file": "string"})
+
+# Replace empty strings with NaN in some columns
+columns_to_replace = ['trip_id', 'route_id', 'stop_id']
+combined_df[columns_to_replace] = combined_df[columns_to_replace].replace('', pd.NA)
+
+# Remove rows where the arrival_time column has an empty value
+combined_df = combined_df.dropna(subset=['arrival_time'])
+
+# Apply the conversion function to arrival and departure times
+combined_df["arrival_datetime"] = combined_df["arrival_time"].apply(convert_to_date_and_time)
+combined_df["departure_datetime"] = combined_df["departure_time"].apply(convert_to_date_and_time)
+
+# Use the source_file column to extract the day/time of the pull (and added tz aware, it's UTC)
+combined_df['pull_datetime'] = combined_df['source_file'].str.extract(r'_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.json$')
+combined_df[['pull_date', 'pull_time']] = combined_df['pull_datetime'].str.split('_', expand=True)
+combined_df['pull_time'] = combined_df['pull_time'].str.replace('-', ':')
+combined_df['pull_datetime'] = pd.to_datetime(combined_df['pull_date'] + ' ' + combined_df['pull_time'], errors='coerce', utc = True)
+combined_df['pull_datetime'] = combined_df['pull_datetime'].dt.tz_convert(ZoneInfo("America/Los_Angeles"))
+
+# Compare the pull day/time and arrival day/time to check if the time is forecasted or not
+combined_df["projection"] = np.where((combined_df["arrival_datetime"] > combined_df["pull_datetime"]), 1, 0)
+
+# Removing the source_file, 
+combined_df = combined_df.drop(["arrival_time",
+                                "departure_time",
+                                "source_file",
+                                "pull_date",
+                                "pull_time"],
+                                axis = 1)
+
+# Re-typing the columns; replacing NA values with None
+combined_df.replace({pd.NA: None, pd.NaT: None}, inplace=True)
+
+combined_df = combined_df.astype({
+    "trip_id": "string",
+    "route_id": "string",
+    "stop_id": "string",
+    "arrival_datetime": "datetime64[ns, America/Los_Angeles]",
+    "departure_datetime": "datetime64[ns, America/Los_Angeles]",
+    "pull_datetime": "datetime64[ns, America/Los_Angeles]"
+})
+
+# Print to check
+print(combined_df.dtypes)
+print(combined_df.head())
+
+# Writing data to PostgreSQL (!!)
+# Function to create the table if it does not exist
+def create_table_if_not_exists(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sea_gtfs_data (
+                unique_id SERIAL PRIMARY KEY,
+                trip_id TEXT,
+                route_id TEXT,
+                stop_id TEXT,
+                arrival_datetime TIMESTAMPTZ,
+                departure_datetime TIMESTAMPTZ,
+                pull_datetime TIMESTAMPTZ,
+                projection BOOLEAN
+            )
+        """)
+        conn.commit()
+
+# Function to bulk load a DataFrame into the PostgreSQL table
+def bulk_insert_dataframe(conn, df, table_name):
+    buffer = StringIO()
+    df.to_csv(buffer, index=False, header=False)
+    buffer.seek(0)
+
+    columns = ["trip_id", "route_id", "stop_id", 
+               "arrival_datetime", "departure_datetime", 
+               "pull_datetime", "projection"]
+
+    with conn.cursor() as cur:
+        cur.copy_expert(
+            sql.SQL("COPY {} ({}) FROM STDIN WITH CSV").format(
+                sql.Identifier(table_name),
+                sql.SQL(', ').join(map(sql.Identifier, columns))
+            ),
+            buffer
+        )
+        conn.commit()
+
+# Main script
+def main():
+    # Database connection parameters
+    db_params = {
+        "dbname": "sea-gtfs-data",
+        "user": "postgres",
+        "password": "Parkour",
+        "host": "localhost",
+        "port": 5432
+    }
+
+    # Connect to the database
+    conn = psycopg2.connect(**db_params)
+
+    try:
+        # Step 1: Create the table if it doesn't exist
+        create_table_if_not_exists(conn)
+
+        # Step 2: Bulk load the DataFrame into the existing table
+        bulk_insert_dataframe(conn, combined_df, "sea_gtfs_data")
+    
+    finally:
+        # Close the connection
+        conn.close()
+
+if __name__ == "__main__":
+    main()

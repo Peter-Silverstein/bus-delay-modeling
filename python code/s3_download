@@ -1,0 +1,91 @@
+import boto3
+import os
+import pandas as pd
+import json
+
+def download_all_files(bucket_name, local_dir):
+    s3 = boto3.client('s3')
+    paginator = s3.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket = bucket_name)
+
+    for page in pages:
+        if 'Contents' in page:
+            for obj in page['Contents']:
+                key = obj['Key']
+                local_file_path = os.path.join(local_dir, key)
+
+                # Create directories if they don't exist already
+                os.makedirs(os.path.dirname(local_file_path), exist_ok = True)
+
+                # Download the file
+                s3.download_file(bucket_name, key, local_file_path)
+
+# Use function
+bucket_name = 'gtfs-data-run1'
+local_dir = 'raw_from_awsS3'
+download_all_files(bucket_name, local_dir)
+
+print("All files downloaded")
+
+# Function to extract trip data
+def extract_trip_data(parsed_feed):
+    trip_data = []
+    for entity in parsed_feed.get("entity", []):
+        if "tripUpdate" in entity:
+            trip_update = entity["tripUpdate"]
+            trip_id = trip_update.get("trip", {}).get("tripId", "")
+            route_id = trip_update.get("trip", {}).get("routeId", "")
+            agency_id = trip_update.get("trip", {}).get("agencyId", "")
+            stop_time_updates = trip_update.get("stopTimeUpdate", [])
+            
+            for stop_time_update in stop_time_updates:
+                stop_id = stop_time_update.get("stopId", "")
+                arrival_time = stop_time_update.get("arrival", {}).get("time", "")
+                departure_time = stop_time_update.get("departure", {}).get("time", "")
+                
+                # Append relevant data as a dictionary
+                trip_data.append({
+                    "trip_id": trip_id,
+                    "route_id": route_id,
+                    "agency_id": agency_id,
+                    "stop_id": stop_id,
+                    "arrival_time": arrival_time,
+                    "departure_time": departure_time,
+                })
+    return trip_data
+
+# Function to iterate over the folder
+def json_to_df(folder_path):
+    all_data = [] # Empty list to store all our dataframes
+
+    # Iterate through all JSON files in the folder
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.json'): 
+            file_path = os.path.join(folder_path, filename)
+
+            # Open and load the JSON file
+            with open(file_path, 'r') as f:
+                parsed_feed = json.load(f)
+
+            # Extract trip data
+            trip_data = extract_trip_data(parsed_feed)
+
+            # Convert to dataframe
+            df = pd.DataFrame(trip_data)
+
+            # Add a column for the source filename
+            df['source_file'] = filename
+
+            # Append to the list of dataframes
+            all_data.append(df)
+
+    # Combine all dataframes into one
+    combined_df = pd.concat(all_data, ignore_index = True)
+
+    return combined_df
+    
+# Apply the function
+local_dir = 'raw_from_awsS3'
+combined_df = json_to_df(local_dir)
+
+print(combined_df.head(30))
