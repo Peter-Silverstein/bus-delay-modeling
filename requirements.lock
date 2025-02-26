@@ -10,9 +10,9 @@
 #   universal: false
 
 -e file:.
-boto3==1.36.11
+boto3==1.36.26
     # via sea-gtfs-proj
-botocore==1.36.11
+botocore==1.36.26
     # via boto3
     # via s3transfer
 certifi==2024.12.14

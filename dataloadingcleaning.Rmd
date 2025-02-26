@@ -17,6 +17,7 @@ library(tidyverse)
 library(ggplot2)
 library(here)
 library(keyring)
+library(furrr)
 
 # PostgreSQL
 library(DBI)
@@ -24,7 +25,7 @@ library(RPostgres)
 
 # GIS and Mapping
 library(sf)
-library(tmap)
+library(lwgeom) 
 
 # Census
 library(tidycensus)
@@ -69,7 +70,7 @@ print(paste("Number of rows reduced from", nrow(gtfs_realtime), "to", nrow(gtfs_
 ## Importing Stop Times
 
 ```{r}
-stop_times <- read_csv("Other Data/gtfs-static-files/stop_times.txt") %>%
+stop_times <- read_csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
   select(trip_id, arrival_time, departure_time, stop_id, stop_sequence, shape_dist_traveled) %>%
   mutate(trip_id = as.factor(trip_id),
          stop_id = as.factor(stop_id)) %>%
@@ -131,7 +132,7 @@ test_df
 ## Loading the dataset
 
 ```{r}
-congestion_temporal <- read_csv("Other Data/Traffic_Count_Studies_by_Hour_Bins-2.csv")
+congestion_temporal <- read_csv("Predictor Data Sets/Traffic_Count_Studies_by_Hour_Bins-2.csv")
 ```
 
 ## Table w/ average traffic volume by day/hour
@@ -206,70 +207,171 @@ gtfs_main_withcongestion <- gtfs_main_withdelays %>%
          "avg_traffic_day" = "AVG_VOL")
 ```
 
-# Route Lines/Stop Points Shapefiles
+# Creating Route-Stop Segments 
 
-## Loading Stop Shapefile
-
+## Loading Relevant Data and Setting Geospatial Components
 ```{r}
-kingcountymetro_stops <- st_read(here("Other Data",
-                                      "KCMetro_Transit_Stops",
-                                      "Transit_Stops_for_King_County_Metro___transitstop_point.shp"))
+# Loading trip data (directionality)
+trips <- read.csv("Predictor Data Sets/gtfs-static-files/trips.txt") %>%
+  select(trip_id, direction_id, shape_id, service_id)
+
+# Loading spatial data (EPSG 4326!)
+stops <- read.csv("Predictor Data Sets/gtfs-static-files/stops.txt") %>%
+  st_as_sf(coords = c("stop_lon", "stop_lat"), crs = 4326) %>%
+  select(stop_id, stop_name, wheelchair_boarding)
+
+# Loading spatial data for routes
+shapes <- read.csv("Predictor Data Sets/gtfs-static-files/shapes.txt") %>%
+  arrange(shape_id, shape_pt_sequence) %>%
+  st_as_sf(coords = c("shape_pt_lon", "shape_pt_lat"), crs = 4326) %>%
+  group_by(shape_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+# Loading stop sequence for each trip
+stop_times <- read.csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+  select(trip_id, stop_id, stop_sequence, arrival_time)
+
 ```
 
+## Function to Handle Directionality
 ```{r}
-# Select Columns; NOTE projected CRS is NAD83
-kcm_stops <- kingcountymetro_stops %>%
-  select(STOP_ID, STOP_STATU, XCOORD, YCOORD, geometry) %>%
-  filter(STOP_STATU == "ACT") %>%
-  select(!STOP_STATU) %>%
-  mutate(STOP_ID = as.factor(STOP_ID)) %>%
-  distinct()
+get_directional_route <- function(target_trip) {
+  # Get shape_id and direction_id based on trip_id
+  trip_info <- trips %>%
+    filter(trip_id == target_trip) %>%
+    select(shape_id, direction_id) %>%
+    distinct()
+  
+  # Get the LINESTRING route shape based on shape_id
+  base_route <- shapes %>%
+    filter(shape_id == trip_info$shape_id)
+  
+  # If direction_id == 1, reverse the route shape
+  if(trip_info$direction_id == 1) {
+    reversed_route <- st_reverse(base_route)
+    return(reversed_route)
+  } else {
+    return(base_route)
+  }
+}
 ```
 
-## Loading Route Shapefile
-
+## Associating Stops with Trips
 ```{r}
-kingcountymetro_routes <- st_read(here("Other Data",
-                                      "KCMetro_Transit_Lines",
-                                      "Transit_Routes_for_King_County_Metro___transitroute_line.shp"))
+# Function that returns a spatial dataframe containing all stops for a trip
+get_trip_stops <- function(target_trip) {
+  stop_times %>%
+    filter(trip_id == target_trip) %>%
+    left_join(stops, by = "stop_id") %>%
+    arrange(stop_sequence) %>%
+    st_as_sf() %>%
+    mutate(stop_order = row_number(),
+           .before = geometry)
+}
 ```
 
+## Projection and Snapping
 ```{r}
-# Select Columns; NOTE projected CRS is NAD83
-kcm_routes <- kingcountymetro_routes %>%
-  select(IN_SERVICE, ROUTE_ID, LOCAL_EXPR, ROUTE_NUM, SHAPE_Leng, geometry) %>%
-  filter(IN_SERVICE == "Y") %>%
-  select(!IN_SERVICE) %>%
-  mutate(ROUTE_ID = as.factor(ROUTE_ID)) %>%
-  distinct(ROUTE_ID, .keep_all = TRUE)
+# stops_sf is from get_trip_stops and route_sf is the directional route
+snap_stops_to_route <- function(stops_sf, route_sf) {
+  # Reprojection for more accurate distance calculation
+  utm10n <- 32610
+  route_proj <- st_transform(route_sf, utm10n)
+  stops_proj <- st_transform(stops_sf, utm10n)
+  
+  # Find the point on line closest to stop
+  snapped <- st_nearest_points(stops_proj, route_proj) %>%
+    st_cast("POINT") %>%
+    lapply(function(x) st_geometry(x)[[2]]) %>% # Return the snapped point, not the original
+    st_as_sfc(crs = utm10n)
+  
+  # Convert back to original CRS
+  st_transform(snapped, 4326)
+}
 ```
 
-## Joining
-
+## Position Calculation 
 ```{r}
-gtfs_main_withstopshapes <- gtfs_main_withdelays %>%
-  left_join(kcm_stops, by = c("stop_id" = "STOP_ID"))
-
-gtfs_main_withrouteshapes <- gtfs_main_withdelays %>%
-  left_join(kcm_routes, by = c("route_id" = "ROUTE_ID"))
+calculate_line_positions <- function(snapped_points, route_line) {
+  # Reprojection for more accurate distance calculation
+  utm10n <- 32610
+  snapped_proj <- st_transform(snapped_points, utm10n)
+  route_proj <- st_transform(route_line, utm10n)
+  
+  # Makes sure that the route_line is a LINESTRING
+  route_linestring <- st_geometry(route_proj)[[1]]
+  
+  # Returns the cumulative distance from the start for each stop
+  positions <- st_line_locate_point(route_linestring, snapped_proj)
+  
+  # Return normalized 0-1 positions (i.e., fraction of route that a stop is along)
+  normalized_positions <- positions / st_length(route_linestring)
+  
+  return(normalized_positions)
+}
 ```
 
+## Route Clipping
 ```{r}
-test_df <- gtfs_main_withrouteshapes %>%
-  filter(is.na(ROUTE_NUM))
-
-test_df
-
-# STOPS: Appears as though the only rows with issues here are ones with stop_id 1746
-# ROUTES: Appears as though any NAs from join also have NA for route_id (i.e., no extra)
+clip_route_segment <- function(route, end_position) {
+  # Reprojection for more accurate distance calculation
+  utm10n <- 32610
+  route_proj <- st_transform(route, utm10n)
+  
+  # Convert normalized distance to actual distance
+  total_length <- st_length(route_proj)
+  clip_distance <- total_length * end_position
+  
+  # Create substring up to target position
+  clipped <- st_line_substring(
+    st_geometry(route_proj)[[1]],
+    from = 0,
+    to = clip_distance
+  )
+    
+  clipped_sf <- st_as_sf(clipped)
+  st_transform(clipped_sf, st_crs(route))
+}
 ```
 
 # Traffic Flow Counts by Arterial
+```{r}
+plan(multisession) # Use all available cores
+
+process_all_trips <- function(trip_ids) {
+  future_map(trip_ids, ~{
+    tryCatch({
+      route <- get_directional_route(.x)
+      stops <- get_trip_stops(.x)
+      snapped <- snap_stops_to_route(stops, route)
+      
+      positions <- calculate_line_positions(snapped, route)
+      
+      # Generate all the clipped segments
+      map2(positions, stops$stop_id, ~{
+        clip_route_segment(route, .x) %>%
+          mutate(
+            trip_id = .x,
+            stop_id = .y,
+            clip_time = Sys.time()
+          )
+      }) %>%
+        bind_rows()
+      
+    }, error = function(e){
+      message("Error processing trip ", .x, ": ", e$message) 
+      return(NULL)
+    })
+  }, .progress = TRUE) %>%
+    bind_rows()
+}
+```
 
 ## Loading Data
 
 ```{r}
-congestion_spatial_initial <- st_read(here("Other Data",
+congestion_spatial_initial <- st_read(here("Predictor Data Sets",
                                    "2018_Traffic_Flow_Counts-shp",
                                    "2018_Traffic_Flow_Counts.shp"))
 ```
@@ -547,6 +649,22 @@ plot_delay_hourday <- ggplot(data = day_hour_delay,
 plot_delay_hourday
 ```
 
+```{r}
+# Delay for route_id = 100001 over time
+route_100001_delay <- gtfs_main_withcongestion %>%
+  filter(route_id == "100001") %>%
+  select(arrival_delay, stop_sequence) %>%
+  group_by(stop_sequence) %>%
+  summarize(arrival_delay = mean(arrival_delay)) %>%
+  ungroup()
+
+plot_delay_100001 <- ggplot(data = route_100001_delay,
+                                  aes(x = stop_sequence,
+                                      y = arrival_delay)) +
+  geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_line()
+
+plot_delay_100001
+```
 
 
 
