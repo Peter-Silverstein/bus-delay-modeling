@@ -1,0 +1,305 @@
+---
+title: "route-stop-segments"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(keyring)
+library(furrr)
+
+# PostgreSQL
+library(DBI)
+library(RPostgres)
+
+# GIS and Mapping
+library(sf)
+library(lwgeom) 
+
+# Census
+library(tidycensus)
+```
+
+# Creating Route-Stop Segments 
+
+## Loading Relevant Data and Setting Geospatial Components
+```{r}
+# Setting projection system for better distance calculations
+utm10n <- 32610
+
+# Loading trip data (directionality)
+trips <- read.csv("Predictor Data Sets/gtfs-static-files/trips.txt") %>%
+  select(trip_id, direction_id, shape_id, service_id) 
+
+# Loading spatial data (EPSG 4326!)
+stops <- read.csv("Predictor Data Sets/gtfs-static-files/stops.txt") %>%
+  st_as_sf(coords = c("stop_lon", "stop_lat"), crs = 4326) %>%
+  select(stop_id, stop_name, wheelchair_boarding) %>%
+  st_transform(utm10n)
+
+# Loading spatial data for routes
+shapes <- read.csv("Predictor Data Sets/gtfs-static-files/shapes.txt") %>%
+  arrange(shape_id, shape_pt_sequence) %>%
+  st_as_sf(coords = c("shape_pt_lon", "shape_pt_lat"), crs = 4326) %>%
+  group_by(shape_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING") %>%
+  st_transform(utm10n)
+
+# Loading stop sequence for each trip
+stop_times <- read.csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+  select(trip_id, stop_id, stop_sequence, arrival_time) %>%
+  mutate(stop_id = as.character(stop_id))
+
+```
+
+## Function to Handle Directionality
+```{r}
+get_directional_route <- function(target_trip) {
+  # Get shape_id and direction_id based on trip_id
+  trip_info <- trips %>%
+    filter(trip_id == target_trip) %>%
+    select(shape_id, direction_id) %>%
+    distinct()
+  
+  # Get the LINESTRING route shape based on shape_id
+  base_route <- shapes %>%
+    filter(shape_id == trip_info$shape_id)
+  
+  # If direction_id == 1, reverse the route shape
+  if(trip_info$direction_id == 1) {
+    reversed_route <- st_reverse(base_route)
+    return(reversed_route)
+  } else {
+    return(base_route)
+  }
+}
+```
+
+## Associating Stops with Trips
+```{r}
+# Function that returns a spatial dataframe containing all stops for a trip
+get_trip_stops <- function(target_trip) {
+  stop_times %>%
+    filter(trip_id == target_trip) %>%
+    left_join(stops, by = "stop_id") %>%
+    arrange(stop_sequence) %>%
+    st_as_sf() %>%
+    mutate(stop_order = row_number(),
+           .before = geometry)
+}
+```
+
+## Projection and Snapping
+```{r}
+snap_stops_to_route <- function(stops_sf, route_sf, max_dist = 1000) {
+  # Point Classification
+  # Find points already on the route
+  on_route <- st_intersects(stops_sf, route_sf, sparse = FALSE)[,1]
+  
+  # Split into two groups
+  original_points <- stops_sf[on_route, ]
+  snap_candidates <- stops_sf[!on_route, ]
+  
+  if (nrow(snap_candidates) == 0) {
+    message("All points already lie on the route geometry")
+    return(st_geometry(original_points))
+  }
+
+  # Distance Filtering
+  # Convert max_dist to units object
+  max_dist <- units::set_units(max_dist, "m", mode = "standard")
+  
+  # Calculate distances in meters
+  distances <- st_distance(snap_candidates, route_sf)
+  min_dists <- units::set_units(apply(distances, 1, min), "m", mode = "standard")
+  
+  # Identify points beyond threshold
+  far_points <- which(min_dists > max_dist)
+  if (length(far_points) > 0) {
+    warning("Removing ", length(far_points), 
+            " points exceeding maximum snap distance (", 
+            format(max_dist), ")")
+    snap_candidates <- snap_candidates[-far_points, ]
+  }
+
+  # Snapping Operation
+  if (nrow(snap_candidates) > 0) {
+    # Perform snapping with safety checks
+    nearest_links <- st_nearest_points(snap_candidates, route_sf)
+    
+    snapped_points <- lapply(nearest_links, function(ln) {
+      pts <- st_cast(ln, "POINT", group_or_split = TRUE)
+      if(length(pts) >= 2) {
+      candidate <- pts[[2]]
+    } else {
+      # Otherwise, use the first coordinate
+      candidate <- pts[[1]]
+      warning("Stop appears to be already on the line; using the original point.")
+    }
+    # If candidate is not already an sfg (i.e. it is just a numeric vector), convert it:
+    if(!inherits(candidate, "sfg")) {
+      candidate <- st_point(candidate)
+    }
+    candidate
+  })
+
+  # Convert the list of sfg objects to an sfc object
+  snapped_points <- st_as_sfc(snapped_list, crs = st_crs(route_sf))
+
+  # Result Assembly
+  final_geometry <- c(
+    st_geometry(original_points),
+    snapped_points
+  ) %>% 
+    st_as_sfc() %>%
+    st_set_crs(st_crs(route_sf))
+
+  # Validation Checks
+  if (length(final_geometry) != nrow(stops_sf) - length(far_points)) {
+    stop("Result count mismatch. Expected ", nrow(stops_sf) - length(far_points),
+         " points, got ", length(final_geometry),
+         ". Check input data integrity.")
+  }
+  }
+
+  return(final_geometry)
+}
+```
+
+## Position Calculation 
+```{r}
+calculate_line_positions <- function(snapped_points, route_line) {
+  # Makes sure that the route_line is a LINESTRING
+  route_linestring <- st_geometry(route_line)[[1]]
+  
+  # Returns the cumulative distance from the start for each stop
+  positions <- st_line_locate_point(route_linestring, snapped_points)
+  
+  # Return normalized 0-1 positions (i.e., fraction of route that a stop is along)
+  normalized_positions <- positions / st_length(route_linestring)
+  
+  return(normalized_positions)
+}
+```
+
+## Route Clipping
+```{r}
+clip_route_segment <- function(route, end_position) {
+  # Convert normalized distance to actual distance
+  total_length <- st_length(route)
+  clip_distance <- total_length * end_position
+  
+  # Create substring up to target position
+  clipped <- st_line_substring(
+    st_geometry(route)[[1]],
+    from = 0,
+    to = clip_distance
+  )
+    
+  clipped_sf <- st_as_sf(clipped)
+}
+```
+
+## Processing Framework
+```{r}
+plan(multisession) # Use all available cores
+
+process_all_trips <- function(trip_ids) {
+  future_map(trip_ids, ~{
+    tryCatch({
+      route <- get_directional_route(.x)
+      stops <- get_trip_stops(.x)
+      snapped <- snap_stops_to_route(stops, route)
+      
+      positions <- calculate_line_positions(snapped, route)
+      
+      # Generate all the clipped segments
+      map2(positions, stops$stop_id, ~{
+        clip_route_segment(route, .x) %>%
+          mutate(
+            trip_id = .x,
+            stop_id = .y,
+            clip_time = Sys.time()
+          )
+      }) %>%
+        bind_rows()
+      
+    }, error = function(e){
+      message("Error processing trip ", .x, ": ", e$message) 
+      return(NULL)
+    })
+  }, .progress = TRUE) %>%
+    bind_rows()
+}
+```
+
+## Processing
+```{r}
+# Test for a single trip ID
+test_trip_id <- "347468097"
+
+# Step 1: Get directional route
+route <- get_directional_route(test_trip_id)
+
+# Step 2: Get stops for the trip
+stops <- get_trip_stops(test_trip_id)
+
+# Step 3: Snap stops to route
+snapped <- snap_stops_to_route(stops, route)
+
+# Step 4: Calculate positions along the route
+positions <- calculate_line_positions(snapped, route)
+
+# Step 5: Clip route segments up to each stop
+clipped_segments <- map2(positions, stops$stop_id, ~{
+  clip_route_segment(route, .x) |>
+    mutate(
+      trip_id = test_trip_id,
+      stop_id = .y,
+      clip_time = Sys.time()
+    )
+}) |>
+  bind_rows()
+
+# Inspect results
+print(clipped_segments)
+
+```
+
+
+
+
+```{r}
+set.seed(50)
+trip_ids <- read.csv("Predictor Data Sets/gtfs-static-files/trips.txt")
+
+trip_ids <- trip_ids$trip_id
+trip_ids_test <- trip_ids[1:10]
+
+trips_clipped <- process_all_trips(trip_ids_test)
+trips_clipped
+```
+
+
+```{r}
+trip_ids <- read.csv("Predictor Data Sets/gtfs-static-files/trips.txt") %>%
+  select(trip_id) 
+
+trip_ids <- trip_ids$trip_id
+
+trips_clipped <- process_all_trips(trip_ids)
+trips_clipped
+```
+
