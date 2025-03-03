@@ -17,7 +17,7 @@ library(tidyverse)
 library(ggplot2)
 library(here)
 library(keyring)
-library(furrr)
+library(lubridate)
 
 # PostgreSQL
 library(DBI)
@@ -26,16 +26,13 @@ library(RPostgres)
 # GIS and Mapping
 library(sf)
 library(lwgeom) 
-
-# Census
-library(tidycensus)
 ```
 
-# Main Dataset
+# Arrival Delay
 
-## Importing Data From SQL
-
+## Importing Data From SQL, filtering, cleaning
 ```{r}
+# Loading Data
 con <- dbConnect(RPostgres::Postgres(),
                  dbname = "sea-gtfs-data",
                  host = "localhost",
@@ -45,12 +42,15 @@ con <- dbConnect(RPostgres::Postgres(),
 
 gtfs_realtime <- dbReadTable(con, "sea_gtfs_data")
 gtfs_realtime <- tibble(gtfs_realtime)
-```
 
-## Cleaning Data/Verifying Types/Removing Duplicates
+# Filtering Data Outside the Seattle Bounding Box (see route-level-predictors)
+route_predictors <- read_csv("predictor_tables/route_predictors")
+routes_within_bb <- as.numeric(route_predictors$ROUTE_ID)
 
-```{r}
-# NEED TO FIGURE OUT TIMES OVER 24H!
+gtfs_realtime <- gtfs_realtime %>%
+  filter(route_id %in% routes_within_bb)
+
+# Filtering out duplicates and future projections
 gtfs_main <- gtfs_realtime %>%
   filter(projection == FALSE) %>%
   distinct(trip_id, stop_id, arrival_datetime, .keep_all = TRUE) %>%
@@ -64,37 +64,51 @@ gtfs_main <- gtfs_realtime %>%
 
 print(paste("Number of rows reduced from", nrow(gtfs_realtime), "to", nrow(gtfs_main)))
 ```
-
-# Stop Times Dataset
-
-## Importing Stop Times
-
+## Importing scheduled stop times, joining to main, calculating delay
 ```{r}
+# Helper function for dealing with hh > 23 in schedule file
+roll_over <- function(time_str) {
+  # Split the time string into hours, minutes, seconds
+  parts <- as.numeric(strsplit(time_str, ":")[[1]])
+  total_seconds <- parts[1] * 3600 + parts[2] * 60 + parts[3]
+  # Use modulo operator to get seconds within a day
+  remainder <- total_seconds %% 86400
+  # Convert remainder seconds back into hh:mm:ss format
+  sprintf("%02d:%02d:%02d", 
+          remainder %/% 3600, 
+          (remainder %% 3600) %/% 60, 
+          remainder %% 60)
+}
+
+# Importing scheduled stop times
 stop_times <- read_csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
   select(trip_id, arrival_time, departure_time, stop_id, stop_sequence, shape_dist_traveled) %>%
   mutate(trip_id = as.factor(trip_id),
-         stop_id = as.factor(stop_id)) %>%
+         stop_id = as.factor(stop_id),
+         arrival_time = as.character(arrival_time),
+         departure_time = as.character(departure_time)) %>%
   rename(sched_arrival_time = arrival_time,
          sched_departure_time = departure_time) %>%
+   mutate(
+    sched_arrival_time = sapply(sched_arrival_time, roll_over),
+    sched_departure_time = sapply(sched_departure_time, roll_over),
+    sched_arrival_time = hms::as_hms(sched_arrival_time),
+    sched_departure_time = hms::as_hms(sched_departure_time)
+  ) %>%
   distinct(trip_id, stop_id, .keep_all = TRUE)
-```
 
-## Joining to Main Dataset
-
-```{r}
-gtfs_main_withstoptimes <- gtfs_main %>%
+# Joining to main
+gtfs_main_withdelays <- gtfs_main %>%
   left_join(stop_times, by = c("trip_id" = "trip_id",
-                              "stop_id" = "stop_id"))
-```
-
-## Calculating Delay
-
-```{r}
-gtfs_main_withdelays <- gtfs_main_withstoptimes %>%
+                              "stop_id" = "stop_id")) %>%
   mutate(actual_arrival_time = hms::as_hms(format(with_tz(arrival_datetime, "America/Los_Angeles"), "%H:%M:%S")),
          actual_departure_time = hms::as_hms(format(with_tz(departure_datetime, "America/Los_Angeles"), "%H:%M:%S")),
          date = as.POSIXct(format(with_tz(arrival_datetime, "America/Los_Angeles"), "%Y-%m-%d"))) %>%
   mutate(arrival_delay = as.numeric(actual_arrival_time - sched_arrival_time)) %>%
+  mutate(arrival_delay = ifelse(
+    arrival_delay < 80000, arrival_delay,
+    arrival_delay - 86400
+    )) %>%
   select(date, 
          trip_id, 
          route_id, 
@@ -109,42 +123,27 @@ gtfs_main_withdelays <- gtfs_main_withstoptimes %>%
          pull_datetime)
 ```
 
-## Checking if Join worked, whether all rows have values for all fields
+# Temporal Traffic
 
 ```{r}
-test_df <- gtfs_main_withdelays %>%
-  filter(is.na(date))
-
-test_df
-
-# Notes
-  # 7626 rows have no date/arrival time
-    # could this mean a skipped trip?
-    # could not discern a pattern to the missing data, but I note that this pattern would appear in cases when stops were skipped or routes were cancelled
-  # 3915 rows have no route_id
-    # could probably look up route_id based on trip_id
-  # Stop ID 1746 has no stop_times join
-    # I cannot discern why this is, exactly, but it's a very small portion of the sample
-```
-
-# Traffic by Time Bin
-
-## Loading the dataset
-
-```{r}
+# Loading data
 congestion_temporal <- read_csv("Predictor Data Sets/Traffic_Count_Studies_by_Hour_Bins-2.csv")
-```
 
-## Table w/ average traffic volume by day/hour
-
-```{r}
+# Converting times, setting up day/hour lookup
 congestion_dayhour <- congestion_temporal %>%
+  filter(TOTAL > 0) %>%
   mutate(datetime = as.POSIXct(ADD_DTTM, 
                                format = "%m/%d/%Y %I:%M:%S %p", 
                                tz = "America/Los_Angeles")) %>%
   filter(datetime > as.POSIXct("01-01-2015 00:00:00", 
                                format = "%m-%d-%Y %H:%M:%S",
-                               tz = "America/Los_Angeles")) %>%
+                               tz = "America/Los_Angeles")) %>% # Filtering to last 10 years
+  filter(datetime < as.POSIXct("01-31-2020 00:00:00", 
+                               format = "%m-%d-%Y %H:%M:%S",
+                               tz = "America/Los_Angeles") |
+           datetime > as.POSIXct("12-31-2021 23:59:59", 
+                               format = "%m-%d-%Y %H:%M:%S",
+                               tz = "America/Los_Angeles")) %>% # Filtering to remove peak pandemic
   group_by(WEEKDAY) %>%
   summarize(HR01 = mean(HR01_TOTAL),
             HR02 = mean(HR02_TOTAL),
@@ -182,18 +181,15 @@ congestion_dayhour <- congestion_temporal %>%
   relocate(WEEKDAY_NAME, .after = WEEKDAY) %>%
   relocate(AVG_VOL, .after = WEEKDAY_NAME)
 
+# Setting up longer format
 congestion_dh_longer <- congestion_dayhour %>%
   select(WEEKDAY_NAME, HR01:HR24) %>%
   pivot_longer(cols = -WEEKDAY_NAME,
                names_to = "HOUR",
                values_to = "avg_traffic_dayhour") %>%
   mutate(HOUR = as.numeric(gsub("[^0-9]","", HOUR)))
-```
 
-## Joining Day/Daypart Congestion
-
-```{r}
-# MAKE SURE TO REMOVE -1 VALUES
+# Joining
 gtfs_main_withcongestion <- gtfs_main_withdelays %>%
   mutate(WEEKDAY = weekdays(date),
          HR = as.numeric(sched_arrival_time) %/% 3600) %>%
@@ -207,7 +203,30 @@ gtfs_main_withcongestion <- gtfs_main_withdelays %>%
          "avg_traffic_day" = "AVG_VOL")
 ```
 
-# Assorted Visualizations
+# Setting up stop sequence and distance travelled
+```{r}
+
+```
+
+
+# Setting up final predictor table
+```{r}
+stop_predictors <- gtfs_main_withcongestion %>%
+  select(route_id, stop_id, arrival_delay, stop_sequence, shape_dist_traveled, weekday, hr, avg_traffic_dayhour)
+```
+
+# Checking for NAs
+
+
+
+
+
+
+
+
+
+
+# MOVEMO EMVMOVEMOVEMVMEO assorted Visualizations
 
 ## Traffic Volume by Day/Time
 

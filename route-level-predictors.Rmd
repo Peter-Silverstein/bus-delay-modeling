@@ -19,79 +19,16 @@ library(here)
 library(keyring)
 library(stringr)
 
-# PostgreSQL
-library(DBI)
-library(RPostgres)
-
 # GIS and Mapping
 library(sf)
-library(lwgeom) 
 library(tmap)
 
 # Census
 library(tidycensus)
 ```
 
-# Set up dataframe to hold route_id + predictors
-
-## Load route_ids
-```{r}
-routes <- read.csv("Predictor Data Sets/gtfs-static-files/routes.txt") %>%
-  filter(agency_id == 1) %>% # Filtering to only include King County Metro agency
-  select(route_id, route_short_name) %>%
-  mutate(rapid_ride = case_when(
-    str_detect(route_short_name, "Line") ~ 1,
-    TRUE ~ 0
-  )) %>%
-  mutate(route_id = as.factor(route_id),
-         rapid_ride = as.factor(rapid_ride)) 
-  
-routes
-```
-
-## Load shapes, confirm CRS
-```{r}
-# Current CRS NAD83
-kc_route_shp <- st_read(here("Predictor Data Sets",
-                           "KCMetro_Transit_Lines",
-                           "Transit_Routes_for_King_County_Metro___transitroute_line.shp")) %>%
-  select(ROUTE_ID, geometry) %>%
-  distinct(ROUTE_ID, .keep_all = TRUE) %>%
-  mutate(ROUTE_ID = as.factor(ROUTE_ID))
-
-# Joining
-routes_shp <- kc_route_shp %>%
-  left_join(routes,
-            by = c("ROUTE_ID" = "route_id")) %>%
-  st_transform(crs = 32610)
-
-routes_shp
-```
-
-# For each route_id, overlay on spatial traffic and compute weighted average
-
-## Load spatial traffic shapefile
-```{r}
-normalize <- function(x, na.rm = TRUE) {
-  return((x - min(x)) / (max(x) - min(x)))
-}
-
-# CRS is NAD83
-# Scaling AWDT with z-scores so "average" traffic is 0, heavier traffic is positive, lighter is negative
-congestion_spatial <- st_read(here("Predictor Data Sets",
-                                   "2018_Traffic_Flow_Counts-shp",
-                                   "2018_Traffic_Flow_Counts.shp")) %>%
-  select(AWDT, geometry) %>%
-  mutate(across(AWDT, scale)) %>%
-  st_transform(crs = 32610)
-```
-
-## Cutting routes to the bounding box of what I have
-```{r}
-
-```
-
-# Traffic Spatial Function
+# Functions
+## Traffic Function
 ```{r}
 get_weighted_traffic_average <- function(route_id) {
   route_shape <- routes_subset %>%
@@ -114,40 +51,7 @@ get_weighted_traffic_average <- function(route_id) {
 }
 ```
 
-# For each route_id, draw a buffer and compute weighted average for ACS Ridership %
-```{r}
-# Using keyring package to keep my API key hidden
-tidycensus_api_key <- key_get(service = "tidycensus_API", username = "my_tidycensus")
-census_api_key(tidycensus_api_key)
-
-ACSlist <- load_variables(2022, "acs5", cache = TRUE)
-```
-
-## Loading ACS Data from Tidycensus
-```{r}
-# Projection is NAD83(!!)
-kingcounty_acs_blocks <- get_acs(state = "WA",
-                                 county = "King",
-                                 geography = "block group",
-                                 variables = c(tot_pop = "B01003_001",
-                                               transp_basetotal = "B08134_001",
-                                               transp_mthd_public = "B08134_061"),
-                                 geometry = TRUE,
-                                 keep_geo_vars = TRUE,
-                                 year = 2023,
-                                 output = "wide") %>%
-  filter(ALAND != 0) %>% # Filter tracts that are 100% water
-  mutate(GEOID = as.double(GEOID))
-
-kcacs_blocks <- kingcounty_acs_blocks %>%
-  mutate(ALAND_miles = ALAND/2589988) %>% # Converting sq meters to sq miles
-  mutate(transp_mthd_public_perc = transp_mthd_publicE / transp_basetotalE) %>%
-  select(tot_popE,
-         transp_mthd_public_perc,
-         geometry) %>%
-  st_transform(crs = 32610)
-```
-
+## Ridership Function
 ```{r}
 get_weighted_transit_ridership <- function(route_id) {
   route_shape <- routes_subset %>%
@@ -185,7 +89,90 @@ get_weighted_transit_ridership <- function(route_id) {
 }
 ```
 
-# Put it all together
+# Loading Data
+
+## Load route_ids
+```{r}
+routes <- read.csv("Predictor Data Sets/gtfs-static-files/routes.txt") %>%
+  filter(agency_id == 1) %>% # Filtering to only include King County Metro agency
+  select(route_id, route_short_name) %>%
+  mutate(rapid_ride = case_when(
+    str_detect(route_short_name, "Line") ~ 1,
+    TRUE ~ 0
+  )) %>%
+  mutate(route_id = as.factor(route_id),
+         rapid_ride = as.factor(rapid_ride)) 
+  
+routes
+```
+
+## Load route shapes, confirm CRS
+```{r}
+# Current CRS NAD83
+kc_route_shp <- st_read(here("Predictor Data Sets",
+                           "KCMetro_Transit_Lines",
+                           "Transit_Routes_for_King_County_Metro___transitroute_line.shp")) %>%
+  select(ROUTE_ID, geometry) %>%
+  distinct(ROUTE_ID, .keep_all = TRUE) %>%
+  mutate(ROUTE_ID = as.factor(ROUTE_ID))
+
+# Joining
+routes_shp <- kc_route_shp %>%
+  left_join(routes,
+            by = c("ROUTE_ID" = "route_id")) %>%
+  st_transform(crs = 32610)
+
+routes_shp
+```
+
+## Load spatial traffic shapefile
+```{r}
+normalize <- function(x, na.rm = TRUE) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+# CRS is NAD83
+# Scaling AWDT with z-scores so "average" traffic is 0, heavier traffic is positive, lighter is negative
+congestion_spatial <- st_read(here("Predictor Data Sets",
+                                   "2018_Traffic_Flow_Counts-shp",
+                                   "2018_Traffic_Flow_Counts.shp")) %>%
+  select(AWDT, geometry) %>%
+  mutate(across(AWDT, scale)) %>%
+  st_transform(crs = 32610)
+```
+
+# Load ACS Ridership
+```{r}
+# Using keyring package to keep my API key hidden
+tidycensus_api_key <- key_get(service = "tidycensus_API", username = "my_tidycensus")
+census_api_key(tidycensus_api_key)
+
+ACSlist <- load_variables(2022, "acs5", cache = TRUE)
+
+# Projection is NAD83(!!)
+kingcounty_acs_blocks <- get_acs(state = "WA",
+                                 county = "King",
+                                 geography = "block group",
+                                 variables = c(tot_pop = "B01003_001",
+                                               transp_basetotal = "B08134_001",
+                                               transp_mthd_public = "B08134_061"),
+                                 geometry = TRUE,
+                                 keep_geo_vars = TRUE,
+                                 year = 2023,
+                                 output = "wide") %>%
+  filter(ALAND != 0) %>% # Filter tracts that are 100% water
+  mutate(GEOID = as.double(GEOID))
+
+kcacs_blocks <- kingcounty_acs_blocks %>%
+  mutate(ALAND_miles = ALAND/2589988) %>% # Converting sq meters to sq miles
+  mutate(transp_mthd_public_perc = transp_mthd_publicE / transp_basetotalE) %>%
+  select(tot_popE,
+         transp_mthd_public_perc,
+         geometry) %>%
+  st_transform(crs = 32610)
+```
+
+# Final Dataset
 ```{r}
 # Filtering dataset to work with my spatial congestion dataset
 ylims <- c(5260550, 5286967)
@@ -207,7 +194,7 @@ route_predictors <- routes_subset %>%
   ungroup() %>%
   st_set_crs(st_crs(routes_subset))
 
-route_predictors
+write_csv(route_predictors, "predictor_tables/route_predictors.csv")
 ```
 
 
