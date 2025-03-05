@@ -45,7 +45,8 @@ gtfs_realtime <- dbReadTable(con, "sea_gtfs_data")
 gtfs_realtime <- tibble(gtfs_realtime)
 
 # Filtering Data Outside the Bounding Box (see route-level-predictors)
-route_predictors <- read_csv("predictor_tables/route_predictors.csv")
+route_predictors <- read_csv(here("predictor_tables",
+                                  "route_predictors.csv"))
 routes_within_bb <- as.numeric(route_predictors$ROUTE_ID)
 
 gtfs_realtime <- gtfs_realtime %>%
@@ -82,7 +83,8 @@ roll_over <- function(time_str) {
 }
 
 # Importing scheduled stop times
-stop_times <- read_csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+stop_times <- read_csv(here("Predictor Data Sets",
+                            "gtfs-static-files/stop_times.txt")) %>%
   select(trip_id, arrival_time, departure_time, stop_id, stop_sequence, shape_dist_traveled) %>%
   mutate(trip_id = as.factor(trip_id),
          stop_id = as.factor(stop_id),
@@ -128,7 +130,8 @@ gtfs_main_withdelays <- gtfs_main %>%
 
 ```{r}
 # Loading data
-congestion_temporal <- read_csv("Predictor Data Sets/Traffic_Count_Studies_by_Hour_Bins-2.csv")
+congestion_temporal <- read_csv(here("Predictor Data Sets",
+                                     "Traffic_Count_Studies_by_Hour_Bins-2.csv"))
 
 # Converting times, setting up day/hour lookup
 congestion_dayhour <- congestion_temporal %>%
@@ -206,7 +209,8 @@ gtfs_main_withcongestion <- gtfs_main_withdelays %>%
 
 # Setting up stop sequence and distance travelled
 ```{r}
-seq_standardized <- read.csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+seq_standardized <- read.csv(here("Predictor Data Sets",
+                                  "gtfs-static-files/stop_times.txt")) %>%
   select(trip_id, stop_sequence) %>%
   group_by(trip_id) %>%
   arrange(stop_sequence) %>%
@@ -248,7 +252,7 @@ stop_predictors <- gtfs_main_final %>%
   select(route_id, stop_id, arrival_delay, new_seq, shape_dist_traveled, weekday, hr, avg_traffic_dayhour) %>%
   mutate(weekday = as.factor(weekday))
 
-write_csv(stop_predictors, "predictor_tables/stop_predictors.csv")
+write_csv(stop_predictors, "../predictor_tables/stop_predictors.csv")
 ```
 
 # Standardizing Final Dataset
@@ -261,7 +265,7 @@ stop_pred_std <- stop_predictors %>%
   select(route_id, stop_id, arrival_delay, new_seq, shape_dist_traveled, avg_traffic_dayhour) %>%
   mutate(across(c("new_seq", "shape_dist_traveled", "avg_traffic_dayhour"), standardize))
 
-write_csv(stop_pred_std, "predictor_tables/stop_pred_std.csv")
+write_csv(stop_pred_std, "../predictor_tables/stop_pred_std.csv")
 ```
 
 # Checking for NAs

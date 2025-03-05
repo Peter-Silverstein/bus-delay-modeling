@@ -93,7 +93,8 @@ get_weighted_transit_ridership <- function(route_id) {
 
 ## Load route_ids
 ```{r}
-routes <- read.csv("Predictor Data Sets/gtfs-static-files/routes.txt") %>%
+routes <- read.csv(here("Predictor Data Sets",
+                        "gtfs-static-files/routes.txt")) %>%
   filter(agency_id == 1) %>% # Filtering to only include King County Metro agency
   select(route_id, route_short_name) %>%
   mutate(rapid_ride = case_when(
@@ -191,7 +192,7 @@ route_predictors <- routes_subset %>%
   ungroup() %>%
   st_set_crs(st_crs(routes_subset))
 
-write_csv(route_predictors, "predictor_tables/route_predictors.csv")
+write_csv(route_predictors, "../predictor_tables/route_predictors.csv")
 ```
 # Standardizing Final Dataset
 ```{r}
@@ -204,7 +205,7 @@ route_pred_std <- route_predictors %>%
   mutate(rapid_ride = as.numeric(rapid_ride)) %>%
   mutate(across(c("rapid_ride", "spatial_traffic", "ridership_perc"), standardize))
 
-write_csv(route_pred_std, "predictor_tables/route_pred_std.csv")
+write_csv(route_pred_std, "../predictor_tables/route_pred_std.csv")
 ```
 
 # Investigating a Bounding Box Defined by Rapid Ride Service
