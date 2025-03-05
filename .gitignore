@@ -4,6 +4,7 @@
 /raw_aws_alreadyloaded/
 /raw_from_awsS3/
 /sea-gtfs-proj/
+/predictor_tables/
 
 # History files
 .Rhistory
