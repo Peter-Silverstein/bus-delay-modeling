@@ -1,5 +1,5 @@
 ---
-title: "sea-gtfs-proj-data-cleaning"
+title: "stop-level-predictors"
 author: "Peter Silverstein"
 date: "`r Sys.Date()`"
 output: html_document
@@ -18,6 +18,7 @@ library(ggplot2)
 library(here)
 library(keyring)
 library(lubridate)
+library(rstanarm)
 
 # PostgreSQL
 library(DBI)
@@ -43,8 +44,8 @@ con <- dbConnect(RPostgres::Postgres(),
 gtfs_realtime <- dbReadTable(con, "sea_gtfs_data")
 gtfs_realtime <- tibble(gtfs_realtime)
 
-# Filtering Data Outside the Seattle Bounding Box (see route-level-predictors)
-route_predictors <- read_csv("predictor_tables/route_predictors")
+# Filtering Data Outside the Bounding Box (see route-level-predictors)
+route_predictors <- read_csv("predictor_tables/route_predictors.csv")
 routes_within_bb <- as.numeric(route_predictors$ROUTE_ID)
 
 gtfs_realtime <- gtfs_realtime %>%
@@ -192,7 +193,7 @@ congestion_dh_longer <- congestion_dayhour %>%
 # Joining
 gtfs_main_withcongestion <- gtfs_main_withdelays %>%
   mutate(WEEKDAY = weekdays(date),
-         HR = as.numeric(sched_arrival_time) %/% 3600) %>%
+         HR = (as.numeric(sched_arrival_time) %/% 3600) + 1) %>%
   left_join(select(.data = congestion_dayhour, WEEKDAY_NAME, AVG_VOL), 
             by = c("WEEKDAY" = "WEEKDAY_NAME")) %>%
   left_join(congestion_dh_longer,
@@ -205,194 +206,135 @@ gtfs_main_withcongestion <- gtfs_main_withdelays %>%
 
 # Setting up stop sequence and distance travelled
 ```{r}
+seq_standardized <- read.csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+  select(trip_id, stop_sequence) %>%
+  group_by(trip_id) %>%
+  arrange(stop_sequence) %>%
+  mutate(new_seq = row_number()) %>%
+  ungroup() %>%
+  arrange(trip_id, stop_sequence) %>%
+  mutate(stop_sequence = as.numeric(stop_sequence),
+         trip_id = as.factor(trip_id))
 
+gtfs_main_final <- gtfs_main_withcongestion %>%
+  inner_join(seq_standardized, 
+            by = c("stop_sequence" = "stop_sequence",
+                   "trip_id" = "trip_id"))
+
+gtfs_main_final <- gtfs_main_final[, c("date",
+                                       "route_id",
+                                       "trip_id",
+                                       "stop_id",
+                                       "sched_arrival_time",
+                                       "sched_departure_time",
+                                       "actual_arrival_time",
+                                       "actual_departure_time",
+                                       "arrival_delay",
+                                       "stop_sequence",
+                                       "new_seq",
+                                       "shape_dist_traveled",
+                                       "pull_datetime",
+                                       "weekday",
+                                       "hr",
+                                       "avg_traffic_day",
+                                       "avg_traffic_dayhour")]
+
+gtfs_main_final
 ```
 
-
-# Setting up final predictor table
+# Final Dataset
 ```{r}
-stop_predictors <- gtfs_main_withcongestion %>%
-  select(route_id, stop_id, arrival_delay, stop_sequence, shape_dist_traveled, weekday, hr, avg_traffic_dayhour)
+stop_predictors <- gtfs_main_final %>%
+  select(route_id, stop_id, arrival_delay, new_seq, shape_dist_traveled, weekday, hr, avg_traffic_dayhour) %>%
+  mutate(weekday = as.factor(weekday))
+
+write_csv(stop_predictors, "predictor_tables/stop_predictors.csv")
+```
+
+# Standardizing Final Dataset
+```{r}
+# Standardize function (note that it's 2*sd)
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / (2*sd(x, na.rm = TRUE))
+}
+stop_pred_std <- stop_predictors %>%
+  select(route_id, stop_id, arrival_delay, new_seq, shape_dist_traveled, avg_traffic_dayhour) %>%
+  mutate(across(c("new_seq", "shape_dist_traveled", "avg_traffic_dayhour"), standardize))
+
+write_csv(stop_pred_std, "predictor_tables/stop_pred_std.csv")
 ```
 
 # Checking for NAs
-
-
-
-
-
-
-
-
-
-
-# MOVEMO EMVMOVEMOVEMVMEO assorted Visualizations
-
-## Traffic Volume by Day/Time
-
 ```{r}
-# Ridgeline Plot of Traffic by Day
-# Seems that I may want to log it
-library(ggridges)
+# Arrival Times
+gtfs_arrival_NAs <- gtfs_main_final %>%
+  filter(is.na(arrival_delay))
 
-congestion_temporal_ridgeline <- congestion_temporal %>%
-  mutate(WEEKDAY_NAME = as.factor(case_when(
-    WEEKDAY == 1 ~ "Monday",
-    WEEKDAY == 2 ~ "Tuesday",
-    WEEKDAY == 3 ~ "Wednesday",
-    WEEKDAY == 4 ~ "Thursday",
-    WEEKDAY == 5 ~ "Friday",
-    WEEKDAY == 6 ~ "Saturday",
-    WEEKDAY == 7 ~ "Sunday"))) %>%
-  filter(TOTAL != -1,
-         TOTAL != 0)
+if (nrow(gtfs_arrival_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_arrival_NAs
+}
 
-ridgeline_trafficday <- ggplot(data = congestion_temporal_ridgeline,
-                               aes(x = log(TOTAL),
-                                   y = WEEKDAY_NAME)) + 
-  geom_density_ridges(scale = 4) +
-  scale_y_discrete(expand = c(0, 0)) + 
-  scale_x_continuous(expand = c(0, 0)) + 
-  coord_cartesian(clip = "off") + 
-  theme_ridges()
-
-ridgeline_trafficday
+# Appears to always be connected to no data/actual arrival time. My best guess is that these are skipped stops or cancelled trips.
+# Represents 1.38% of the dataset as of 03.05.2025 (20,478 rows)
 ```
 
 ```{r}
-# Plot of Average Congestion by Hour by Day
-plot_congestion_hourday <- ggplot(data = congestion_dh_longer,
-                                  aes(x = HOUR,
-                                      y = avg_traffic_dayhour,
-                                      color = WEEKDAY_NAME,
-                                      linetype = WEEKDAY_NAME)) +
-  geom_line()
+# route_id, stop_id
+gtfs_ids_NAs <- gtfs_main_final %>%
+  filter(is.na(stop_id))
 
-plot_congestion_hourday
-```
+if (nrow(gtfs_ids_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_ids_NAs
+}
 
-## Delay Plots
-
-```{r}
-# Delay by Day
-library(ggridges)
-
-delay_day_ridgeline <- gtfs_main_withcongestion %>%
-  filter(arrival_delay > -2500)
-
-ridgeline_delayday <- ggplot(data = delay_day_ridgeline,
-                               aes(x = arrival_delay,
-                                   y = weekday)) + 
-  geom_density_ridges(scale = 4) +
-  scale_y_discrete(expand = c(0, 0)) + 
-  scale_x_continuous(expand = c(0, 0)) + 
-  coord_cartesian(clip = "off") + 
-  theme_ridges()
-
-ridgeline_delayday
+# Empty for both route_id and stop_id as of 03.05.2025
 ```
 
 ```{r}
-# Scatterplot of avg congestion by avg delay
-delay_traffic_data <- gtfs_main_withcongestion %>%
-  filter(arrival_delay > -2500) %>%
-  mutate(dayhour_traffic_bins = cut(avg_traffic_dayhour, 
-                                    breaks = c(-Inf, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, Inf),
-                                    labels = c("0-50", "50-100", "100-150", "150-200", "200-250", "250-300", "300-350",
-                                               "350-400", "400-450", "450-500", "500-550", "550-600", "600+")))
+# new_seq
+gtfs_seq_NAs <- gtfs_main_final %>%
+  filter(is.na(new_seq))
 
-scatter_delaytraffic <- ggplot(data = delay_traffic_data,
-                               aes(x = dayhour_traffic_bins,
-                                   y = arrival_delay,
-                                   color = dayhour_traffic_bins)) +
-  geom_jitter() + 
-  theme(legend.position = "none")
-scatter_delaytraffic
+if (nrow(gtfs_seq_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_seq_NAs
+}
+
+# Empty as of 03.05.2025
 ```
 
 ```{r}
-# Scatterplot of avg congestion by avg delay
-delay_traffic_data <- gtfs_main_withcongestion %>%
-  filter(arrival_delay > -2500) %>%
-  mutate(dayhour_traffic_bins = cut(avg_traffic_dayhour, 
-                                    breaks = c(-Inf, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, Inf),
-                                    labels = c("0-50", "50-100", "100-150", "150-200", "200-250", "250-300", "300-350",
-                                               "350-400", "400-450", "450-500", "500-550", "550-600", "600+")))
+# shape_dist_traveled
+gtfs_dist_NAs <- gtfs_main_final %>%
+  filter(is.na(shape_dist_traveled))
 
-scatter_delaytraffic <- ggplot(data = delay_traffic_data,
-                               aes(x = arrival_delay,
-                                   y = dayhour_traffic_bins,
-                                   fill = dayhour_traffic_bins)) +
-  geom_density_ridges() + 
-  theme(legend.position = "none") +
-  xlim(-500, 500)
-scatter_delaytraffic
+if (nrow(gtfs_dist_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_dist_NAs
+}
+
+# Empty as of 03.05.2025
 ```
 
 ```{r}
-# Delay by Day/Hour
-day_hour_delay <- gtfs_main_withcongestion %>%
-  filter(arrival_delay > 0,
-         arrival_delay < 300) %>%
-  select(hr, arrival_delay, weekday) %>%
-  group_by(weekday, hr) %>%
-  summarize(arrival_delay = mean(arrival_delay)) %>%
-  ungroup()
+# avg_traffic_dayhour
+gtfs_traf_NAs <- gtfs_main_final %>%
+  filter(is.na(avg_traffic_dayhour) & !is.na(date))
 
-plot_delay_hourday <- ggplot(data = day_hour_delay,
-                                  aes(x = hr,
-                                      y = arrival_delay,
-                                      color = weekday,
-                                      linetype = weekday)) +
-  geom_line()
+if (nrow(gtfs_traf_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_traf_NAs
+}
 
-plot_delay_hourday
+# Empty as of 03.05.2025
 ```
-
-```{r}
-# Delay for route_id = 100001 over time
-route_100001_delay <- gtfs_main_withcongestion %>%
-  filter(route_id == "100001") %>%
-  select(arrival_delay, stop_sequence) %>%
-  group_by(stop_sequence) %>%
-  summarize(arrival_delay = mean(arrival_delay)) %>%
-  ungroup()
-
-plot_delay_100001 <- ggplot(data = route_100001_delay,
-                                  aes(x = stop_sequence,
-                                      y = arrival_delay)) +
-  geom_point() + geom_smooth(method = "lm", se = FALSE) + geom_line()
-
-plot_delay_100001
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

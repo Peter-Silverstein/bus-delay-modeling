@@ -1,0 +1,87 @@
+---
+title: "exploratory-data-viz"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(patchwork)
+library(ggridges)
+library(GGally)
+
+# GIS and Mapping
+library(sf)
+library(tmap) 
+```
+
+# Loading Data
+```{r echo = FALSE}
+stop_pred_std <- read_csv("predictor_tables/stop_pred_std.csv", show_col_types = FALSE)
+route_pred_std <- read_csv("predictor_tables/route_pred_std.csv", show_col_types = FALSE)
+```
+
+# Joining Data Tables
+```{r}
+table <- stop_pred_std %>%
+  inner_join(route_pred_std,
+             by = c("route_id" = "ROUTE_ID")) %>%
+  filter(!is.na(arrival_delay)) %>%
+  mutate(rapid_ride = as.factor(rapid_ride))
+```
+
+# Plots of Outcome vs. Each Predictor
+```{r}
+# Setting up table for correlation plots
+table_1 <- table %>%
+  select(arrival_delay, new_seq, shape_dist_traveled, avg_traffic_dayhour, rapid_ride, spatial_traffic, ridership_perc) %>%
+  relocate(rapid_ride, .after = ridership_perc) %>%
+  filter(arrival_delay > -1000 & arrival_delay < 1000)
+
+plot <- ggplot(table_1, aes(x = arrival_delay, color = rapid_ride)) + geom_density()
+plot
+```
+
+```{r}
+fit <- lm(arrival_delay ~ 
+            new_seq + 
+            shape_dist_traveled + 
+            avg_traffic_dayhour + 
+            rapid_ride + 
+            spatial_traffic + 
+            ridership_perc +
+            spatial_traffic:avg_traffic_dayhour,
+          data = table)
+
+summary(fit)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,5 +1,5 @@
 ---
-title: "traffic-spatial"
+title: "route-level-predictors"
 author: "Peter Silverstein"
 date: "`r Sys.Date()`"
 output: html_document
@@ -100,8 +100,10 @@ routes <- read.csv("Predictor Data Sets/gtfs-static-files/routes.txt") %>%
     str_detect(route_short_name, "Line") ~ 1,
     TRUE ~ 0
   )) %>%
+  replace_na(list(rapid_ride = 0)) %>%
   mutate(route_id = as.factor(route_id),
-         rapid_ride = as.factor(rapid_ride)) 
+         rapid_ride = as.factor(rapid_ride)) %>%
+  select(route_id, rapid_ride)
   
 routes
 ```
@@ -127,17 +129,12 @@ routes_shp
 
 ## Load spatial traffic shapefile
 ```{r}
-normalize <- function(x, na.rm = TRUE) {
-  return((x - min(x)) / (max(x) - min(x)))
-}
-
 # CRS is NAD83
 # Scaling AWDT with z-scores so "average" traffic is 0, heavier traffic is positive, lighter is negative
 congestion_spatial <- st_read(here("Predictor Data Sets",
                                    "2018_Traffic_Flow_Counts-shp",
                                    "2018_Traffic_Flow_Counts.shp")) %>%
   select(AWDT, geometry) %>%
-  mutate(across(AWDT, scale)) %>%
   st_transform(crs = 32610)
 ```
 
@@ -196,7 +193,32 @@ route_predictors <- routes_subset %>%
 
 write_csv(route_predictors, "predictor_tables/route_predictors.csv")
 ```
+# Standardizing Final Dataset
+```{r}
+# Standardize function (note that it's 2*sd)
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / (2*sd(x, na.rm = TRUE))
+}
+route_pred_std <- route_predictors %>%
+  select(ROUTE_ID, rapid_ride, spatial_traffic, ridership_perc, geometry) %>%
+  mutate(rapid_ride = as.numeric(rapid_ride)) %>%
+  mutate(across(c("rapid_ride", "spatial_traffic", "ridership_perc"), standardize))
 
+write_csv(route_pred_std, "predictor_tables/route_pred_std.csv")
+```
+
+# Investigating a Bounding Box Defined by Rapid Ride Service
+
+!! This is important--we need to rethink the bounding box. Should have C, D, E, G, H. Never going to get the A, B, or F bc they're fully out of the city !!
+```{r}
+# Filtering routes_shp to only include RR
+rr_shp <- routes_shp %>%
+  filter(rapid_ride == 1) # %>%
+  # mutate(route_short_name = as.factor(route_short_name))
+
+tm_shape(rr_shp) + tm_lines("red") +
+  tm_shape(congestion_spatial) + tm_lines("grey")
+```
 
 
 
