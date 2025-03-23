@@ -19,6 +19,7 @@ library(here)
 library(keyring)
 library(lubridate)
 library(rstanarm)
+library(data.table)
 
 # PostgreSQL
 library(DBI)
@@ -26,7 +27,6 @@ library(RPostgres)
 
 # GIS and Mapping
 library(sf)
-library(lwgeom) 
 ```
 
 # Arrival Delay
@@ -246,10 +246,18 @@ gtfs_main_final <- gtfs_main_final[, c("date",
 gtfs_main_final
 ```
 
+# Random Sampling
+
+```{r}
+set.seed(50)
+n_rows <- 10000
+gtfs_sampled_train <- gtfs_main_final[sample(nrow(gtfs_main_final), n_rows), ]
+```
+
 # Final Dataset
 ```{r}
-stop_predictors <- gtfs_main_final %>%
-  select(route_id, stop_id, arrival_delay, new_seq, shape_dist_traveled, weekday, hr, avg_traffic_dayhour) %>%
+stop_predictors <- gtfs_sampled_train %>%
+  select(route_id, stop_id, arrival_delay, shape_dist_traveled, weekday, hr, avg_traffic_dayhour) %>%
   mutate(weekday = as.factor(weekday))
 
 write_csv(stop_predictors, "../predictor_tables/stop_predictors.csv")
@@ -259,11 +267,12 @@ write_csv(stop_predictors, "../predictor_tables/stop_predictors.csv")
 ```{r}
 # Standardize function (note that it's 2*sd)
 standardize <- function(x) {
-  (x - mean(x, na.rm = TRUE)) / (2*sd(x, na.rm = TRUE))
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
 }
 stop_pred_std <- stop_predictors %>%
-  select(route_id, stop_id, arrival_delay, new_seq, shape_dist_traveled, avg_traffic_dayhour) %>%
-  mutate(across(c("new_seq", "shape_dist_traveled", "avg_traffic_dayhour"), standardize))
+  select(route_id, stop_id, arrival_delay, shape_dist_traveled, avg_traffic_dayhour, weekday, hr) %>%
+  mutate(across(c("avg_traffic_dayhour"), standardize)) %>%
+  mutate(abs_dev = abs(arrival_delay))
 
 write_csv(stop_pred_std, "../predictor_tables/stop_pred_std.csv")
 ```
@@ -340,6 +349,11 @@ if (nrow(gtfs_traf_NAs) == 0) {
 # Empty as of 03.05.2025
 ```
 
+```{r}
+gtfs_testing <- gtfs_main_final %>%
+  group_by(date, trip_id) %>%
+  arrange(new_seq, .by_group = TRUE)
+```
 
 
 

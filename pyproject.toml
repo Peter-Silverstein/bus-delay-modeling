@@ -13,9 +13,9 @@ dependencies = [
     "psycopg2>=2.9.10",
     "psycopg2-binary>=2.9.10",
     "psycopg>=3.2.4",
-    "boto3>=1.36.26",
-    "pandas>=2.2.3",
     "numpy>=2.2.3",
+    "pandas>=2.2.3",
+    "boto3>=1.37.9",
 ]
 readme = "README.md"
 requires-python = ">= 3.12"

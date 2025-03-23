@@ -19,6 +19,9 @@ library(here)
 library(patchwork)
 library(ggridges)
 library(GGally)
+library(rstanarm)
+library(lme4)
+library(arm)
 
 # GIS and Mapping
 library(sf)
@@ -27,8 +30,8 @@ library(tmap)
 
 # Loading Data
 ```{r echo = FALSE}
-stop_pred_std <- read_csv("predictor_tables/stop_pred_std.csv", show_col_types = FALSE)
-route_pred_std <- read_csv("predictor_tables/route_pred_std.csv", show_col_types = FALSE)
+stop_pred_std <- read_csv(here("predictor_tables","stop_pred_std.csv"), show_col_types = FALSE)
+route_pred_std <- read_csv(here("predictor_tables","route_pred_std.csv"), show_col_types = FALSE)
 ```
 
 # Joining Data Tables
@@ -37,39 +40,111 @@ table <- stop_pred_std %>%
   inner_join(route_pred_std,
              by = c("route_id" = "ROUTE_ID")) %>%
   filter(!is.na(arrival_delay)) %>%
-  mutate(rapid_ride = as.factor(rapid_ride))
+  mutate(rapid_ride = as.factor(rapid_ride)) %>%
+  mutate(route_id = as.factor(route_id),
+         weekday = as.factor(weekday),
+         hr = as.factor(hr))
 ```
 
-# Plots of Outcome vs. Each Predictor
+# Distribution of Arrival Times
 ```{r}
 # Setting up table for correlation plots
 table_1 <- table %>%
-  select(arrival_delay, new_seq, shape_dist_traveled, avg_traffic_dayhour, rapid_ride, spatial_traffic, ridership_perc) %>%
-  relocate(rapid_ride, .after = ridership_perc) %>%
-  filter(arrival_delay > -1000 & arrival_delay < 1000)
+  dplyr::select(abs_dev, arrival_delay, shape_dist_traveled, avg_traffic_dayhour, rapid_ride, spatial_traffic, ridership_perc, hr, route_id) %>%
+  relocate(rapid_ride, .after = ridership_perc)
 
 plot <- ggplot(table_1, aes(x = arrival_delay, color = rapid_ride)) + geom_density()
+
 plot
 ```
 
-```{r}
-fit <- lm(arrival_delay ~ 
-            new_seq + 
-            shape_dist_traveled + 
-            avg_traffic_dayhour + 
-            rapid_ride + 
-            spatial_traffic + 
-            ridership_perc +
-            spatial_traffic:avg_traffic_dayhour,
-          data = table)
+# Plots
 
-summary(fit)
+## Shape Distance Travelled vs. Arrival Delay
+
+```{r}
+ggplot(data = table_1, 
+       aes(x = shape_dist_traveled,
+           y = abs_dev,
+           color = rapid_ride)) +
+  geom_point()
 ```
 
+## Traffic (time) vs. Arrival Delay
 
+```{r}
+ggplot(data = table_1, 
+       aes(x = avg_traffic_dayhour,
+           y = abs_dev,
+           color = rapid_ride)) +
+  geom_point()
+```
 
+## Traffic (spatial) vs. Arrival Delay
 
+```{r}
+ggplot(data = table_1, 
+       aes(x = spatial_traffic,
+           y = abs_dev,
+           color = rapid_ride)) +
+  geom_point()
+```
 
+## Ridership Percentage vs. Arrival Delay
+
+```{r}
+ggplot(data = table_1, 
+       aes(x = ridership_perc,
+           y = abs_dev,
+           color = rapid_ride)) +
+  geom_point()
+```
+
+```{r}
+summary_stats <- table %>%
+  mutate(rapid_ride = as.numeric(rapid_ride) - 1) %>%
+  group_by(route_id) %>%
+  summarize(
+    mean = mean(abs_dev, na.rm = TRUE),
+    se = sd(abs_dev, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    rapid_ride = as.factor(mean(rapid_ride))
+    )
+
+ggplot(summary_stats, aes(x = route_id, y = mean, color = rapid_ride)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  labs(
+    title = "Mean Outcome by Factor Level",
+    subtitle = "Error bars represent ± 1 standard error",
+    x = "Factor Level",
+    y = "Mean Outcome"
+  ) +
+  theme_minimal() +
+  coord_flip()
+```
+
+```{r}
+fit <- lmer(abs_dev ~ rapid_ride + ridership_perc + spatial_traffic + 
+                    avg_traffic_dayhour + shape_dist_traveled + route_id + 
+              (1 + rapid_ride | weekday/hr),
+                  data = table)
+```
+
+```{r}
+display(fit)
+```
+
+```{r}
+fit2 <- lmer(abs_dev ~ ridership_perc + 
+               spatial_traffic + 
+               avg_traffic_dayhour + 
+               shape_dist_traveled + rapid_ride + route_id +
+              (1 | weekday/hr),
+                  data = table)
+
+display(fit2)
+```
 
 
 

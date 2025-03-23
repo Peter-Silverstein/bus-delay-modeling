@@ -37,6 +37,7 @@ get_weighted_traffic_average <- function(route_id) {
   intersection <- st_intersection(congestion_spatial, buffered_route)
   intersection_line <- st_collection_extract(intersection, "LINESTRING")
   
+  # Note this is avg of traffic data we have, so not all routes have complete coverage
   processed_intersection <- intersection_line %>%
     mutate(length = units::set_units(st_length(geometry), "m", mode = "standard")) %>% # Calculate length of each segment
     filter(length > units::set_units(5, "m", mode = "standard")) # Filtering out any segment less than 5m in length to remove noise
@@ -104,7 +105,7 @@ routes <- read.csv(here("Predictor Data Sets",
   replace_na(list(rapid_ride = 0)) %>%
   mutate(route_id = as.factor(route_id),
          rapid_ride = as.factor(rapid_ride)) %>%
-  select(route_id, rapid_ride)
+  select(route_id, rapid_ride, route_short_name)
   
 routes
 ```
@@ -131,12 +132,13 @@ routes_shp
 ## Load spatial traffic shapefile
 ```{r}
 # CRS is NAD83
-# Scaling AWDT with z-scores so "average" traffic is 0, heavier traffic is positive, lighter is negative
 congestion_spatial <- st_read(here("Predictor Data Sets",
                                    "2018_Traffic_Flow_Counts-shp",
                                    "2018_Traffic_Flow_Counts.shp")) %>%
   select(AWDT, geometry) %>%
   st_transform(crs = 32610)
+
+congestion_spatial
 ```
 
 # Load ACS Ridership
@@ -172,12 +174,12 @@ kcacs_blocks <- kingcounty_acs_blocks %>%
 
 # Final Dataset
 ```{r}
-# Filtering dataset to work with my spatial congestion dataset
+# Filtering dataset to work with my spatial congestion dataset + include RapidRide C, D, E, G lines
 ylims <- c(5260550, 5286967)
 xlims <- c(543840.2, 557439.2)
 box_coords <- tibble(x = xlims, y = ylims) %>% 
   st_as_sf(coords = c("x", "y")) %>% 
-  st_set_crs(st_crs(routes_shp))
+  st_set_crs(st_crs(congestion_spatial))
 
 bounding_box <- st_bbox(box_coords) %>% st_as_sfc()
 
@@ -190,7 +192,8 @@ route_predictors <- routes_subset %>%
     ridership_perc = get_weighted_transit_ridership(ROUTE_ID)
   ) %>%
   ungroup() %>%
-  st_set_crs(st_crs(routes_subset))
+  st_set_crs(st_crs(routes_subset)) %>%
+  filter(!is.na(ROUTE_ID))
 
 write_csv(route_predictors, "../predictor_tables/route_predictors.csv")
 ```
@@ -198,12 +201,12 @@ write_csv(route_predictors, "../predictor_tables/route_predictors.csv")
 ```{r}
 # Standardize function (note that it's 2*sd)
 standardize <- function(x) {
-  (x - mean(x, na.rm = TRUE)) / (2*sd(x, na.rm = TRUE))
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
 }
 route_pred_std <- route_predictors %>%
   select(ROUTE_ID, rapid_ride, spatial_traffic, ridership_perc, geometry) %>%
   mutate(rapid_ride = as.numeric(rapid_ride)) %>%
-  mutate(across(c("rapid_ride", "spatial_traffic", "ridership_perc"), standardize))
+  mutate(across(c("spatial_traffic"), standardize))
 
 write_csv(route_pred_std, "../predictor_tables/route_pred_std.csv")
 ```
@@ -213,12 +216,16 @@ write_csv(route_pred_std, "../predictor_tables/route_pred_std.csv")
 !! This is important--we need to rethink the bounding box. Should have C, D, E, G, H. Never going to get the A, B, or F bc they're fully out of the city !!
 ```{r}
 # Filtering routes_shp to only include RR
-rr_shp <- routes_shp %>%
-  filter(rapid_ride == 1) # %>%
+rr_shp <- routes_subset # %>%
+  # filter(rapid_ride == 1) # %>%
   # mutate(route_short_name = as.factor(route_short_name))
 
-tm_shape(rr_shp) + tm_lines("red") +
-  tm_shape(congestion_spatial) + tm_lines("grey")
+rr_shp2 <- routes_subset %>%
+  filter(rapid_ride == 1) # %>%
+
+tm_shape(rr_shp) + tm_lines("red") + 
+  tm_shape(congestion_spatial) + tm_lines("grey") +
+  tm_shape(rr_shp2) + tm_lines("blue")
 ```
 
 
