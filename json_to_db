@@ -165,6 +165,9 @@ def bulk_insert_dataframe(conn, df, table_name):
         conn.commit()
 
 # Main script
+# MODIFY THESE LINES IN YOUR CODE
+# In the main script section:
+
 def main():
     # Database connection parameters
     db_params = {
@@ -179,15 +182,48 @@ def main():
     conn = psycopg2.connect(**db_params)
 
     try:
-        # Step 1: Create the table if it doesn't exist
+        # Create table if not exists
         create_table_if_not_exists(conn)
+        
+        # NEW: Process data in batches
+        chunk_size = 50000  # Adjust based on your system's capacity
+        total_rows = len(combined_df)
+        
+        for start in range(0, total_rows, chunk_size):
+            end = min(start + chunk_size, total_rows)
+            chunk = combined_df.iloc[start:end]
+            
+            print(f"Processing rows {start+1}-{end} of {total_rows}")
+            
+            # NEW: Clear buffers after each chunk
+            with conn:
+                with conn.cursor() as cur:
+                    buffer = StringIO()
+                    chunk.to_csv(buffer, index=False, header=False, columns=[
+                        "trip_id", "route_id", "stop_id",
+                        "arrival_datetime", "departure_datetime",
+                        "pull_datetime", "projection"
+                    ])
+                    buffer.seek(0)
+                    
+                    copy_sql = sql.SQL("""
+                        COPY sea_gtfs_data (
+                            trip_id, route_id, stop_id,
+                            arrival_datetime, departure_datetime,
+                            pull_datetime, projection
+                        ) FROM STDIN WITH CSV
+                    """)
+                    
+                    cur.copy_expert(copy_sql, buffer)
+                    conn.commit()
+                    
+                    # Explicitly clean up resources
+                    buffer.close()
+                    del buffer
 
-        # Step 2: Bulk load the DataFrame into the existing table
-        bulk_insert_dataframe(conn, combined_df, "sea_gtfs_data")
-    
     finally:
-        # Close the connection
         conn.close()
+
 
 if __name__ == "__main__":
     main()

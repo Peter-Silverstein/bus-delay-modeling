@@ -1,0 +1,120 @@
+---
+title: "TestingSpatial"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(keyring)
+library(stringr)
+
+# GIS and Mapping
+library(sf)
+library(tmap)
+
+# Census
+library(tidycensus)
+```
+# Loading Necessary Files
+
+```{r}
+# Loading Files
+# Loading trip data (directionality)
+trips <- read.csv("Predictor Data Sets/gtfs-static-files/trips.txt") %>%
+  select(trip_id, direction_id, shape_id, service_id) 
+
+# Loading spatial data for routes
+shapes <- read.csv("Predictor Data Sets/gtfs-static-files/shapes.txt") %>%
+  arrange(shape_id, shape_pt_sequence) %>%
+  st_as_sf(coords = c("shape_pt_lon", "shape_pt_lat"), crs = 4326) %>%
+  group_by(shape_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING") %>%
+  st_transform(2285)
+
+# Loading stop sequence for each trip
+stop_times <- read.csv("Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+  select(trip_id, stop_id, stop_sequence, arrival_time) %>%
+  mutate(stop_id = as.character(stop_id))
+```
+
+# Function to Return Direction-Conscious Linestring for TripIDs
+
+```{r}
+get_directional_route <- function(target_trip) {
+  # Get shape_id and direction_id based on trip_id
+  trip_info <- trips %>%
+    filter(trip_id == target_trip) %>%
+    select(shape_id, direction_id) %>%
+    distinct()
+  
+  # Get the LINESTRING route shape based on shape_id
+  base_route <- shapes %>%
+    filter(shape_id == trip_info$shape_id)
+  
+  # If direction_id == 1, reverse the route shape
+  if(trip_info$direction_id == 1) {
+    reversed_route <- st_reverse(base_route)
+    return(reversed_route)
+  } else {
+    return(base_route)
+  }
+}
+```
+
+
+```{r}
+trips_withshapes <- trips %>%
+  select(trip_id, shape_id, direction_id) %>%
+  distinct(trip_id, shape_id, direction_id) %>%
+  left_join(shapes,
+             by = c("shape_id" = "shape_id")) %>%
+  mutate(geometry = case_when(
+    direction_id == 1 ~ st_reverse(geometry),
+    TRUE ~ geometry
+  ))
+```
+
+```{r}
+stops_withshapes <- stop_times %>%
+  select(!arrival_time) %>%
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

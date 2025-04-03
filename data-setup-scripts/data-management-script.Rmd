@@ -1,0 +1,707 @@
+---
+title: "stop-level-predictors"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(keyring)
+library(lubridate)
+library(rstanarm)
+library(data.table)
+
+# PostgreSQL
+library(DBI)
+library(RPostgres)
+
+# GIS and Mapping
+library(sf)
+```
+
+# Arrival Delay
+
+## Importing Data From SQL, filtering, cleaning
+```{r}
+# Loading Data
+con <- dbConnect(RPostgres::Postgres(),
+                 dbname = "sea-gtfs-data",
+                 host = "localhost",
+                 port = 5432,
+                 user = "postgres",
+                 password = "Parkour")
+
+gtfs_realtime <- dbReadTable(con, "sea_gtfs_data")
+gtfs_realtime <- tibble(gtfs_realtime)
+
+# Filtering dataset to work with my spatial congestion dataset + include RapidRide C, D, G lines
+
+# Current CRS NAD83
+kc_route_shp <- st_read(here("Predictor Data Sets",
+                           "KCMetro_Transit_Lines",
+                           "Transit_Routes_for_King_County_Metro___transitroute_line.shp")) %>%
+  select(ROUTE_ID, geometry) %>%
+  distinct(ROUTE_ID, .keep_all = TRUE)
+
+routes <- read.csv(here("Predictor Data Sets",
+                        "gtfs-static-files/routes.txt")) %>%
+  filter(agency_id == 1) %>% # Filtering to only include King County Metro agency
+  select(route_id, route_short_name) %>%
+  mutate(rapid_ride = case_when(
+    str_detect(route_short_name, "Line") ~ 1,
+    TRUE ~ 0
+  )) %>%
+  replace_na(list(rapid_ride = 0)) %>%
+  mutate(route_id = as.numeric(route_id),
+         rapid_ride = as.factor(rapid_ride)) %>%
+  select(route_id, rapid_ride, route_short_name)
+
+# Joining
+routes_shp <- kc_route_shp %>%
+  left_join(routes,
+            by = c("ROUTE_ID" = "route_id")) %>%
+  st_transform(crs = 2285)
+
+ylims <- c(184191.9, 271524.6)
+xlims <- c(1250336, 1293480)
+box_coords <- tibble(x = xlims, y = ylims) %>% 
+  st_as_sf(coords = c("x", "y")) %>% 
+  st_set_crs(2285)
+
+bounding_box <- st_bbox(box_coords) %>% st_as_sfc()
+
+routes_subset <- st_filter(routes_shp, bounding_box, .predicate = st_within)
+routes_inbb <- routes_subset$ROUTE_ID
+
+gtfs_realtime <- gtfs_realtime %>%
+  filter(route_id %in% routes_inbb)
+
+# Filtering out duplicates and future projections
+gtfs_main <- gtfs_realtime %>%
+  filter(projection == FALSE) %>%
+  distinct(trip_id, stop_id, arrival_datetime, .keep_all = TRUE) %>%
+  select(trip_id, route_id, stop_id, arrival_datetime, departure_datetime, pull_datetime) %>%
+  mutate(trip_id = as.factor(trip_id),
+         route_id = as.factor(route_id),
+         stop_id = as.factor(stop_id)) %>%
+  mutate(arrival_datetime = with_tz(arrival_datetime, "America/Los_Angeles"),
+         departure_datetime = with_tz(departure_datetime, "America/Los_Angeles"),
+         pull_datetime = with_tz(pull_datetime, "America/Los_Angeles"))
+
+print(paste("Number of rows reduced from", nrow(gtfs_realtime), "to", nrow(gtfs_main)))
+```
+## Importing scheduled stop times, joining to main, calculating delay
+```{r}
+# Helper function for dealing with hh > 23 in schedule file
+roll_over <- function(time_str) {
+  # Split the time string into hours, minutes, seconds
+  parts <- as.numeric(strsplit(time_str, ":")[[1]])
+  total_seconds <- parts[1] * 3600 + parts[2] * 60 + parts[3]
+  # Use modulo operator to get seconds within a day
+  remainder <- total_seconds %% 86400
+  # Convert remainder seconds back into hh:mm:ss format
+  sprintf("%02d:%02d:%02d", 
+          remainder %/% 3600, 
+          (remainder %% 3600) %/% 60, 
+          remainder %% 60)
+}
+
+# Importing scheduled stop times
+stop_times <- read_csv(here("Predictor Data Sets",
+                            "gtfs-static-files/stop_times.txt")) %>%
+  select(trip_id, arrival_time, departure_time, stop_id, stop_sequence, shape_dist_traveled) %>%
+  mutate(trip_id = as.factor(trip_id),
+         stop_id = as.factor(stop_id),
+         arrival_time = as.character(arrival_time),
+         departure_time = as.character(departure_time)) %>%
+  rename(sched_arrival_time = arrival_time,
+         sched_departure_time = departure_time) %>%
+   mutate(
+    sched_arrival_time = sapply(sched_arrival_time, roll_over),
+    sched_departure_time = sapply(sched_departure_time, roll_over),
+    sched_arrival_time = hms::as_hms(sched_arrival_time),
+    sched_departure_time = hms::as_hms(sched_departure_time)
+  ) %>%
+  distinct(trip_id, stop_id, .keep_all = TRUE)
+
+# Joining to main
+gtfs_main_withdelays <- gtfs_main %>%
+  left_join(stop_times, by = c("trip_id" = "trip_id",
+                              "stop_id" = "stop_id")) %>%
+  mutate(actual_arrival_time = hms::as_hms(format(with_tz(arrival_datetime, "America/Los_Angeles"), "%H:%M:%S")),
+         actual_departure_time = hms::as_hms(format(with_tz(departure_datetime, "America/Los_Angeles"), "%H:%M:%S")),
+         date = as.POSIXct(format(with_tz(arrival_datetime, "America/Los_Angeles"), "%Y-%m-%d"))) %>%
+  mutate(arrival_delay = as.numeric(actual_arrival_time - sched_arrival_time)) %>%
+  mutate(arrival_delay = ifelse(
+    arrival_delay < 80000, arrival_delay,
+    arrival_delay - 86400
+    )) %>%
+  select(date, 
+         trip_id, 
+         route_id, 
+         stop_id, 
+         sched_arrival_time, 
+         sched_departure_time,
+         actual_arrival_time,
+         actual_departure_time,
+         arrival_delay,
+         stop_sequence,
+         shape_dist_traveled,
+         pull_datetime)
+```
+
+# Temporal Traffic
+
+```{r}
+# Loading data
+congestion_temporal <- read_csv(here("Predictor Data Sets",
+                                     "Traffic_Count_Studies_by_Hour_Bins-2.csv"))
+
+# Converting times, setting up day/hour lookup
+congestion_dayhour <- congestion_temporal %>%
+  filter(TOTAL > 0) %>%
+  mutate(datetime = as.POSIXct(ADD_DTTM, 
+                               format = "%m/%d/%Y %I:%M:%S %p", 
+                               tz = "America/Los_Angeles")) %>%
+  filter(datetime > as.POSIXct("01-01-2015 00:00:00", 
+                               format = "%m-%d-%Y %H:%M:%S",
+                               tz = "America/Los_Angeles")) %>% # Filtering to last 10 years
+  filter(datetime < as.POSIXct("01-31-2020 00:00:00", 
+                               format = "%m-%d-%Y %H:%M:%S",
+                               tz = "America/Los_Angeles") |
+           datetime > as.POSIXct("12-31-2021 23:59:59", 
+                               format = "%m-%d-%Y %H:%M:%S",
+                               tz = "America/Los_Angeles")) %>% # Filtering to remove peak pandemic
+  group_by(WEEKDAY) %>%
+  summarize(HR01 = mean(HR01_TOTAL),
+            HR02 = mean(HR02_TOTAL),
+            HR03 = mean(HR03_TOTAL),
+            HR04 = mean(HR04_TOTAL),
+            HR05 = mean(HR05_TOTAL),
+            HR06 = mean(HR06_TOTAL),
+            HR07 = mean(HR07_TOTAL),
+            HR08 = mean(HR08_TOTAL),
+            HR09 = mean(HR09_TOTAL),
+            HR10 = mean(HR10_TOTAL),
+            HR11 = mean(HR11_TOTAL),
+            HR12 = mean(HR12_TOTAL),
+            HR13 = mean(HR13_TOTAL),
+            HR14 = mean(HR14_TOTAL),
+            HR15 = mean(HR15_TOTAL),
+            HR16 = mean(HR16_TOTAL),
+            HR17 = mean(HR17_TOTAL),
+            HR18 = mean(HR18_TOTAL),
+            HR19 = mean(HR19_TOTAL),
+            HR20 = mean(HR20_TOTAL),
+            HR21 = mean(HR21_TOTAL),
+            HR22 = mean(HR22_TOTAL),
+            HR23 = mean(HR23_TOTAL),
+            HR24 = mean(HR24_TOTAL)) %>%
+  mutate(WEEKDAY_NAME = case_when(
+    WEEKDAY == 1 ~ "Monday",
+    WEEKDAY == 2 ~ "Tuesday",
+    WEEKDAY == 3 ~ "Wednesday",
+    WEEKDAY == 4 ~ "Thursday",
+    WEEKDAY == 5 ~ "Friday",
+    WEEKDAY == 6 ~ "Saturday",
+    WEEKDAY == 7 ~ "Sunday")) %>%
+  mutate(AVG_VOL = select(., HR01:HR24) %>% rowMeans(na.rm = TRUE)) %>%
+  relocate(WEEKDAY_NAME, .after = WEEKDAY) %>%
+  relocate(AVG_VOL, .after = WEEKDAY_NAME)
+
+# Setting up longer format
+congestion_dh_longer <- congestion_dayhour %>%
+  select(WEEKDAY_NAME, HR01:HR24) %>%
+  pivot_longer(cols = -WEEKDAY_NAME,
+               names_to = "HOUR",
+               values_to = "avg_traffic_dayhour") %>%
+  mutate(HOUR = as.numeric(gsub("[^0-9]","", HOUR)))
+
+# Joining
+gtfs_main_withcongestion <- gtfs_main_withdelays %>%
+  mutate(WEEKDAY = weekdays(date),
+         HR = (as.numeric(sched_arrival_time) %/% 3600) + 1) %>%
+  left_join(select(.data = congestion_dayhour, WEEKDAY_NAME, AVG_VOL), 
+            by = c("WEEKDAY" = "WEEKDAY_NAME")) %>%
+  left_join(congestion_dh_longer,
+            by = c("WEEKDAY" = "WEEKDAY_NAME",
+                   "HR" = "HOUR")) %>%
+    rename("weekday" = "WEEKDAY",
+         "hr" = "HR",
+         "avg_traffic_day" = "AVG_VOL")
+```
+
+# Setting up stop sequence and distance travelled
+```{r}
+seq_standardized <- read.csv(here("Predictor Data Sets",
+                                  "gtfs-static-files/stop_times.txt")) %>%
+  select(trip_id, stop_sequence) %>%
+  group_by(trip_id) %>%
+  arrange(stop_sequence) %>%
+  mutate(new_seq = row_number()) %>%
+  ungroup() %>%
+  arrange(trip_id, stop_sequence) %>%
+  mutate(stop_sequence = as.numeric(stop_sequence),
+         trip_id = as.factor(trip_id))
+
+gtfs_main_final <- gtfs_main_withcongestion %>%
+  inner_join(seq_standardized, 
+            by = c("stop_sequence" = "stop_sequence",
+                   "trip_id" = "trip_id"))
+
+gtfs_main_final <- gtfs_main_final[, c("date",
+                                       "route_id",
+                                       "trip_id",
+                                       "stop_id",
+                                       "sched_arrival_time",
+                                       "sched_departure_time",
+                                       "actual_arrival_time",
+                                       "actual_departure_time",
+                                       "arrival_delay",
+                                       "stop_sequence",
+                                       "new_seq",
+                                       "shape_dist_traveled",
+                                       "pull_datetime",
+                                       "weekday",
+                                       "hr",
+                                       "avg_traffic_day",
+                                       "avg_traffic_dayhour")]
+
+gtfs_main_final
+```
+
+# Getting Rapid_Ride
+```{r}
+routes <- read.csv(here("Predictor Data Sets",
+                        "gtfs-static-files/routes.txt")) %>%
+  filter(agency_id == 1) %>% # Filtering to only include King County Metro agency
+  select(route_id, route_short_name) %>%
+  mutate(rapid_ride = case_when(
+    str_detect(route_short_name, "Line") ~ 1,
+    TRUE ~ 0
+  )) %>%
+  replace_na(list(rapid_ride = 0)) %>%
+  mutate(route_id = as.factor(route_id),
+         rapid_ride = as.factor(rapid_ride)) %>%
+  select(route_id, rapid_ride)
+
+gtfs_main_withrapidride <- gtfs_main_final %>%
+  left_join(routes,
+            by = "route_id")
+```
+
+# Pre-Geometry Clean-up (Final FULL dataset)
+```{r}
+stop_predictors <- gtfs_main_withrapidride %>%
+  select(route_id, trip_id, stop_id, rapid_ride, arrival_delay, shape_dist_traveled, weekday, hr, avg_traffic_dayhour) %>%
+  filter(!is.na(arrival_delay)) %>%
+  mutate(weekday = as.factor(weekday))
+
+write_csv(stop_predictors, "../predictor_tables/stop_predictors.csv")
+```
+
+# Sampling
+
+## 50k for training, 50k for testing = 100k total
+
+```{r}
+set.seed(50)
+
+# Train/Test Partition
+subset_size <- 100000
+subset_indices <- sample(seq_len(nrow(stop_predictors)), size = subset_size)
+
+subset <- stop_predictors[subset_indices, ]
+rest <- stop_predictors[-subset_indices, ]
+```
+
+# Spatial Predictors (make sure have trip id)
+
+## Loading Shapes and Clipping Segment Shapes
+```{r}
+# Loading trip data (directionality)
+trips <- read.csv("../Predictor Data Sets/gtfs-static-files/trips.txt") %>%
+  select(route_id, trip_id, direction_id, shape_id) %>%
+  filter(route_id %in% routes_inbb)
+
+# Loading spatial data for routes
+shapes <- read.csv("../Predictor Data Sets/gtfs-static-files/shapes.txt") %>%
+  arrange(shape_id, shape_pt_sequence) %>%
+  st_as_sf(coords = c("shape_pt_lon", "shape_pt_lat"), crs = 4326) %>%
+  group_by(shape_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING") %>%
+  st_transform(2285)
+
+# Loading stop sequence for each trip
+stop_times <- read.csv("../Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+  select(trip_id, stop_id, shape_dist_traveled, arrival_time) %>%
+  mutate(shape_dist_traveled = shape_dist_traveled) %>% 
+  mutate(stop_id = as.character(stop_id),
+         trip_id = as.character(trip_id)) %>%
+  distinct(stop_id, trip_id,
+           .keep_all = TRUE)
+
+subset_directionality <- subset %>%
+  left_join(trips,
+            by = "trip_id")
+
+# Return Direction-Conscious Linestring for TripIDs
+subset_withshapes <- subset_directionality %>%
+  left_join(shapes,
+             by = c("shape_id" = "shape_id")) %>%
+  mutate(geometry = case_when(
+    direction_id == 1 ~ st_reverse(geometry),
+    TRUE ~ geometry),
+    trip_id = as.character(trip_id)
+  ) %>%
+  st_as_sf() %>%
+  st_set_crs(st_crs(shapes))
+
+# Clipping route lines
+subset_clipped <- subset_withshapes %>%
+  mutate(trip_id = as.character(trip_id),
+         shape_dist_traveled = case_when(
+           shape_dist_traveled == 0 ~ 1,
+           TRUE ~ shape_dist_traveled
+         )) %>%
+  select(!route_id.y) %>%
+  rename("route_id" = "route_id.x") %>%
+  mutate(
+    route_id = as.numeric(route_id),
+    total_length = as.numeric(st_length(geometry)),
+    # Normalize distance to [0,1] fraction
+    to_fraction = pmin(shape_dist_traveled / total_length, 1)
+  ) %>%
+  rowwise() %>% 
+  mutate(
+    geometry = lwgeom::st_linesubstring(
+      geometry,
+      from = 0,
+      to = to_fraction,
+      normalize = FALSE
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf() %>%
+  st_set_crs(st_crs(2285))
+```
+
+## Avg Traffic by Segment
+
+### Custom Function
+```{r}
+get_weighted_traffic_average <- function(geometry) {
+  buffered_route <- st_buffer(geometry, dist = 1)
+  intersection <- st_intersection(congestion_spatial, buffered_route)
+  intersection_line <- st_collection_extract(intersection, "LINESTRING")
+  
+  # Note this is avg of traffic data we have, so not all routes have complete coverage
+  processed_intersection <- intersection_line %>%
+    mutate(length = units::set_units(st_length(geometry), "ft", mode = "standard")) %>% # Calculate length of each segment
+    filter(length > units::set_units(5, "ft", mode = "standard")) # Filtering out any segment less than 5ft in length to remove noise
+
+  total_length <- sum(processed_intersection$length)
+  
+  processed_intersection <- processed_intersection %>%
+    mutate(wgt_traffic = AWDT * (length / total_length))
+  
+  segment_traffic <- as.numeric(sum(processed_intersection$wgt_traffic))
+  return(segment_traffic)
+}
+```
+
+### Loading spatial congestion dataset
+```{r}
+# CRS is NAD83
+congestion_spatial <- st_read(here("Predictor Data Sets",
+                                   "2018_Traffic_Flow_Counts-shp",
+                                   "2018_Traffic_Flow_Counts.shp")) %>%
+  select(AWDT, geometry) %>%
+  st_transform(crs = 2285)
+```
+
+### Rowwise Application
+```{r}
+subset_spatialcongestion <- subset_clipped %>% 
+  rowwise() %>% 
+  mutate(spatial_congestion = get_weighted_traffic_average(geometry)) %>%
+  ungroup()
+```
+
+## ACS Weighted Demos by Segment
+
+### Custom Function
+```{r}
+# Ridership
+get_weighted_acs <- function(geometry) {
+  buffered_route <- st_buffer(geometry, dist = 2640) # approximate 0.5 mile buffer (in feet)
+  
+  # Filter ACS polygons to include only ones with over 50% within buffer
+  blocks_filtered <- kcacs_blocks %>%
+    filter(lengths(st_intersects(., buffered_route)) > 0) %>%
+    rowwise() %>%
+    mutate(
+      inter_geom = list(st_intersection(geometry, buffered_route)),
+      inter_area = {
+        ig <- inter_geom[]
+        if(length(ig) == 0 || all(st_is_empty(ig))) {
+          0
+          } else {
+            sum(st_area(ig))
+            }
+        },
+      total_area = st_area(geometry),
+      overlap_ratio = as.numeric(inter_area / total_area)
+      ) %>%
+    ungroup() %>%
+    filter(overlap_ratio >= 0.5)
+  
+  # Weighted average
+  total_population <- sum(blocks_filtered$tot_popE)
+  
+  blocks_filtered <- blocks_filtered %>%
+    mutate(wgt_popdens = pop_density * (tot_popE/total_population),
+           wgt_ridership = transp_mthd_public_perc * (tot_popE/total_population),
+           wgt_percwhite = white_perc * (tot_popE/total_population),
+           wgt_medHHI = median_HHI * (tot_popE/total_population))
+  
+  list(
+    pop_density = as.double(sum(blocks_filtered$wgt_popdens)),
+    route_ridership = as.double(sum(blocks_filtered$wgt_ridership)),
+    perc_white = as.double(sum(blocks_filtered$wgt_percwhite)),
+    median_hhi = as.double(sum(blocks_filtered$wgt_medHHI))
+  )
+}
+```
+
+
+### Loading ACS variables
+```{r}
+# Using keyring package to keep my API key hidden
+tidycensus_api_key <- key_get(service = "tidycensus_API", username = "my_tidycensus")
+census_api_key(tidycensus_api_key)
+
+ACSlist <- load_variables(2022, "acs5", cache = TRUE)
+
+# Projection is NAD83(!!)
+kingcounty_acs_blocks <- get_acs(state = "WA",
+                                 county = "King",
+                                 geography = "block group",
+                                 variables = c(tot_pop = "B01003_001",
+                                               transp_basetotal = "B08134_001",
+                                               transp_mthd_public = "B08134_061",
+                                               race_base = "B02001_001",
+                                               race_white = "B02001_002",
+                                               median_HHI = "B19013_001"),
+                                 geometry = TRUE,
+                                 keep_geo_vars = TRUE,
+                                 year = 2023,
+                                 output = "wide") %>%
+  filter(ALAND != 0) %>% # Filter tracts that are 100% water
+  mutate(GEOID = as.double(GEOID))
+
+kcacs_blocks <- kingcounty_acs_blocks %>%
+  mutate(ALAND_miles = ALAND/2589988) %>% # Converting sq meters to sq miles
+  mutate(transp_mthd_public_perc = transp_mthd_publicE / transp_basetotalE,
+         pop_density = tot_popE / ALAND_miles,
+         white_perc = race_whiteE / race_baseE,
+         median_HHI = median_HHIE) %>%
+  select(tot_popE,
+         pop_density,
+         transp_mthd_public_perc,
+         white_perc,
+         median_HHI,
+         geometry) %>%
+  st_transform(crs = 2285)
+```
+
+### Rowwise Application
+```{r}
+subset_withacs <- subset_spatialcongestion %>% 
+  rowwise() %>% 
+  mutate(results = list(get_weighted_acs(geometry))) %>%
+  unnest_wider(results) %>%
+  ungroup()
+```
+
+# Final Dataset
+```{r}
+# Standardize function
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+subset_standardized <- subset_withacs %>%
+  select(route_id, 
+         stop_id, 
+         trip_id, 
+         rapid_ride, 
+         arrival_delay, 
+         shape_dist_traveled, 
+         avg_traffic_dayhour, 
+         spatial_congestion,
+         pop_density,
+         route_ridership,
+         perc_white,
+         median_hhi,
+         weekday, 
+         hr) %>%
+  mutate(across(c("shape_dist_traveled", 
+                  "avg_traffic_dayhour", 
+                  "spatial_congestion",
+                  "pop_density",
+                  "route_ridership",
+                  "perc_white",
+                  "median_hhi"),
+                standardize)) %>%
+  mutate(abs_dev = abs(arrival_delay))
+```
+
+```{r}
+# Setting some definitions
+weekdays <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+weekends <- c("Saturday", "Sunday")
+peak <- c(6, 7, 8, 9, 16, 17, 18, 19) # weekdays only
+non_peak <- c(1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24)
+
+data_final <- subset_standardized %>%
+  mutate(g_weekend = case_when(
+    weekday %in% weekdays ~ 0,
+    weekday %in% weekends ~ 1
+  ),
+  g_peak = case_when(
+    weekday %in% weekdays & hr %in% peak ~ 1,
+    TRUE ~ 0
+  )) %>%
+  dplyr::select(route_id, 
+         stop_id, 
+         trip_id, 
+         rapid_ride, 
+         arrival_delay, 
+         shape_dist_traveled, 
+         avg_traffic_dayhour, 
+         spatial_congestion,
+         pop_density,
+         route_ridership,
+         perc_white,
+         median_hhi,
+         weekday, 
+         hr,
+         g_peak,
+         g_weekend) %>%
+  mutate(
+    weekday = case_when(
+      weekday == "Monday" ~ 1,
+      weekday == "Tuesday" ~ 2,
+      weekday == "Wednesday" ~ 3,
+      weekday == "Thursday" ~ 4,
+      weekday == "Friday" ~ 5,
+      weekday == "Saturday" ~ 6,
+      weekday == "Sunday" ~ 7
+    )) %>%
+  mutate(rapid_ride = as.factor(rapid_ride),
+         weekday = as.numeric(weekday),
+         hr = as.numeric(hr)) %>%
+  rename("g_routeid" = "route_id",
+         "g_weekday" = "weekday",
+         "g_hr" = "hr")
+
+write_csv(data_final, "../predictor_tables/final_data.csv")
+```
+
+# Checking for NAs
+```{r}
+# Arrival Times
+gtfs_arrival_NAs <- gtfs_main_final %>%
+  filter(is.na(arrival_delay))
+
+if (nrow(gtfs_arrival_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_arrival_NAs
+}
+
+# Appears to always be connected to no data/actual arrival time. My best guess is that these are skipped stops or cancelled trips.
+# Represents 1.38% of the dataset as of 03.05.2025 (20,478 rows)
+```
+
+```{r}
+# route_id, stop_id
+gtfs_ids_NAs <- gtfs_main_final %>%
+  filter(is.na(stop_id))
+
+if (nrow(gtfs_ids_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_ids_NAs
+}
+
+# Empty for both route_id and stop_id as of 03.05.2025
+```
+
+```{r}
+# new_seq
+gtfs_seq_NAs <- gtfs_main_final %>%
+  filter(is.na(new_seq))
+
+if (nrow(gtfs_seq_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_seq_NAs
+}
+
+# Empty as of 03.05.2025
+```
+
+```{r}
+# shape_dist_traveled
+gtfs_dist_NAs <- gtfs_main_final %>%
+  filter(is.na(shape_dist_traveled))
+
+if (nrow(gtfs_dist_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_dist_NAs
+}
+
+# Empty as of 03.05.2025
+```
+
+```{r}
+# avg_traffic_dayhour
+gtfs_traf_NAs <- gtfs_main_final %>%
+  filter(is.na(avg_traffic_dayhour) & !is.na(date))
+
+if (nrow(gtfs_traf_NAs) == 0) {
+    message("The filter returned an empty data frame")
+} else {
+  gtfs_traf_NAs
+}
+
+# Empty as of 03.05.2025
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

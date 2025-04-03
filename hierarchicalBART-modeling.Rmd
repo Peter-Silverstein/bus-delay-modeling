@@ -1,0 +1,278 @@
+---
+title: "hierarchicalBART-modeling"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(arm)
+
+# Modeling
+library(stan4bart)
+library(bartCause)
+library(rstanarm)
+```
+
+# Loading Data
+
+```{r}
+stop_pred_std <- read_csv(here("predictor_tables","stop_pred_std.csv"), show_col_types = FALSE)
+route_pred_std <- read_csv(here("predictor_tables","route_pred_std.csv"), show_col_types = FALSE)
+
+weekdays <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+weekends <- c("Saturday", "Sunday")
+peak <- c(6, 7, 8, 9, 16, 17, 18, 19) # weekdays only
+non_peak <- c(1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24)
+
+data <- stop_pred_std %>%
+  inner_join(route_pred_std,
+             by = c("route_id" = "ROUTE_ID")) %>%
+  filter(!is.na(arrival_delay)) %>%
+  mutate(g_weekend = case_when(
+    weekday %in% weekdays ~ 0,
+    weekday %in% weekends ~ 1
+  ),
+  g_peak = case_when(
+    weekday %in% weekdays & hr %in% peak ~ 1,
+    TRUE ~ 0
+  )) %>%
+  dplyr::select(abs_dev, 
+         rapid_ride, 
+         shape_dist_traveled, 
+         avg_traffic_dayhour, 
+         weekday, 
+         hr, 
+         spatial_traffic, 
+         ridership_perc,
+         route_id,
+         g_peak,
+         g_weekend) %>%
+  mutate(rapid_ride = case_when(
+    rapid_ride == 1 ~ 0,
+    rapid_ride == 2 ~ 1),
+    weekday = case_when(
+      weekday == "Monday" ~ 1,
+      weekday == "Tuesday" ~ 2,
+      weekday == "Wednesday" ~ 3,
+      weekday == "Thursday" ~ 4,
+      weekday == "Friday" ~ 5,
+      weekday == "Saturday" ~ 6,
+      weekday == "Sunday" ~ 7
+    )) %>%
+  mutate(rapid_ride = as.factor(rapid_ride),
+         weekday = as.numeric(weekday),
+         hr = as.numeric(hr)) %>%
+  rename("g_routeid" = "route_id",
+         "g_weekday" = "weekday",
+         "g_hr" = "hr")
+```
+
+# Train and Test Sets/Final Variable Selection/Matrix Setup
+
+```{r}
+# JUST NEED TO SPLIT THE DATA IN HALF
+set.seed(50)
+
+# Train/Test Partition
+smp_size <- floor(0.005 * nrow(data))
+train_indices <- sample(seq_len(nrow(data)), size = smp_size)
+
+train <- data[train_indices, ]
+test <- data[-train_indices, ]
+```
+
+# Balance Diagnostics
+
+```{r}
+# Function to get balance diagnostics
+# From https://github.com/gperrett/stan4bart-study/blob/master/get_balance.R
+# Linked in Dorie et al 2022
+get_balance <- function(rawdata, treat,estimand="ATT"){
+  if(missing(rawdata)) stop("rawdata is required")
+  if(missing(treat)) stop("treatment vector (treat) is required")
+  cat("Balance diagnostics assume that the estimand is the",estimand,"\n")
+  #
+  #raw.dat <- data.frame(rawdata, treat = treat)
+  covnames <- colnames(rawdata)
+  if (is.null(covnames)){
+    cat("No covariate names provided.  Generic names will be generated.")
+    covnames = paste("v",c(1:ncol(rawdata)),sep="")
+  }
+  K <- length(covnames)
+  diff.means <- matrix(NA, K, 5)
+  var.t <- numeric(K)
+  var.c <- numeric(K)
+  std.denom <- numeric(K)
+  binary <- rep(1,K)
+  
+  for (i in 1:K) {
+    # separate means by group
+    diff.means[i, 1] <- mean(rawdata[treat==1, i])
+    diff.means[i, 2] <- mean(rawdata[treat==0, i])
+    # separate variances by group == only used as input to calculations below
+    var.t[i] <- var(rawdata[(treat == 1), i])
+    var.c[i] <- var(rawdata[(treat == 0), i])
+    # denominator in standardized difference calculations
+    if(estimand=="ATE"){std.denom[i] <- sqrt((var.t[i]+var.c[i])/2)}
+    else{
+      std.denom[i] <- ifelse(estimand=="ATT",sqrt(var.t[i]),sqrt(var.c[i]))
+    }
+    # difference in means
+    diff.means[i, 3] <- diff.means[i, 1] - diff.means[i, 2]
+    # standardized difference in means (sign intact)
+    diff.means[i, 4] <- abs(diff.means[i, 3]/std.denom[i])
+    if(length(unique(rawdata[,covnames[i]]))>2){
+      binary[i] = 0
+      diff.means[i, 5] <- sqrt(var.c[i]/var.t[i])
+    }
+  }
+  
+  dimnames(diff.means) <- list(covnames, c("treat", "control", "unstd.diff",
+                                           "abs.std.diff", "ratio"))
+  
+  
+  return(diff.means)
+}
+
+# Setting up data (covariates in a matrix, treatment vector)
+# Removed factor vars
+X <- as.matrix(train[, c("g_hr", "g_weekday", "shape_dist_traveled", "avg_traffic_dayhour", "spatial_traffic", "ridership_perc")])
+y <- train$rapid_ride
+
+# Running the function
+get_balance(rawdata = X, treat = y, estimand = "ATT")
+```
+
+# Model Setup & Fit
+
+## ROUTEID and STOP? Hierarcichal
+```{r}
+model <- stan4bart(abs_dev ~ bart(.-rapid_ride-g_weekday-g_hr-g_weekend-g_peak) + rapid_ride + (1 | weekday/hr),
+                   data = train,
+                   treatment = rapid_ride,
+                   cores = 2,
+                   chains = 8,
+                   iter = 2000,
+                   seed = 50,
+                   verbose = 2,
+                   bart_args = list(n.trees = 150))
+```
+
+# Prediction/Treatment Effect Estimation
+
+## Treatment Effects Among the Treated
+
+Note that this is ALL conducted on the "training" set defined in a previous code block. Confusingly, the `sample = "test"` argument actually means that the function is calculating counterfactual potential outcomes, not that it is using some test data set.
+
+```{r}
+# Function to extract relevant information from the model
+extract_stan4bart <- function(fit, .model) {
+  
+  # Extract posterior predictive distributions for test set (returns "non-treated" predictions for all units)
+  samples.ppd.test <- extract(fit, type = "ppd", sample = "test")
+  
+  # SATT Calculation
+  ## First, individual treatment effect
+  samples.ite <- (train$y - samples.ppd.test) * (2 * train$rapid_ride - 1)
+  
+  ## Filter data to only contain treated units
+  samples.ite <- samples.ite[train$rapid_ride == 1,]
+  
+  ## Sample average treatment effect
+  samples.satt <- apply(samples.ite, 2, mean)
+  satt <- mean(samples.satt)
+  satt.int <- quantile(samples.satt, c(.025, .975))
+  
+  # Individual Conditional Average Treatment Effect (not really that applicable here but still interesting)
+  samples.mu.train <- stan4bart:::extract.stan4bartFit(fit)
+  samples.mu.test  <- stan4bart:::extract.stan4bartFit(fit, sample = "test")
+  samples.icate <- (samples.mu.train  - samples.mu.test) * (2 * fit$frame[[fit$treatment]] - 1)
+  
+  # Results
+  average.pred <- sate
+  interval <- satt.int
+  icate.pred <- apply(samples.icate, 1, mean)
+  icate.pred <- icate.pred[train$rapid_ride == 1]
+  
+  # Subgroup Analysis 
+  ## Weekday (1-7)
+  g_weekday <- train$g_weekday[train$rapid_ride == 1]
+  g_weekday.pred <- unlist(lapply(split(icate.pred, g_weekday), mean))
+  
+  ## Weekend (Yes == 1, No == 0)
+  g_weekend <- train$g_weekend[train$rapid_ride == 1]
+  g_weekend.pred <- unlist(lapply(split(icate.pred, g_weekend), mean))
+  
+  ## Peak (Yes == 1, No == 0)
+  g_peak <- train$g_peak[train$rapid_ride == 1]
+  g_peak.pred <- unlist(lapply(split(icate.pred, g_peak), mean))
+  
+  ## Route (Rapid_Ride == 1 + Route_ID)
+  g_routeid <- train$g_routeid[train$rapid_ride == 1]
+  g_routeid.pred <- unlist(lapply(split(icate.pred, g_routeid), mean))
+  
+  # Performance Metrics (NEED TO EDIT TO MATCH MY STUFF)
+  out <- data.frame(
+  u_bias = average.pred - average.truth,
+  s_bias = (average.pred - average.truth) /sd(abs_dev),
+  ci_len = (interval[2] - interval[1]) / sd(abs_dev), 
+  cover = as.double(interval[1] <= average.truth && average.truth <= interval[2]),
+  pehe = sqrt(mean((icate.pred - icate.truth)^2)) / sd(abs_dev),
+  pegste_weekday = sqrt(mean((g_weekday.pred - g_weekday.truth)^2)) / sd(abs_dev),
+  pegste_weekend = sqrt(mean((g_weekend.pred - g_weekend.truth)^2)) / sd(abs_dev),
+  pegste_peak = sqrt(mean((g_peak.pred - g_peak.truth)^2)) / sd(abs_dev),
+  pegste_routeid = sqrt(mean((g_routeid.pred - g_routeid.truth)^2)) / sd(abs_dev),
+  model = .model, 
+  tau = tau
+  )
+}
+```
+
+# Graphs
+
+
+# Descriptive Tables as well!
+# Routes, maps, thesis!!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

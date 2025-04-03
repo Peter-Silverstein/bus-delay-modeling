@@ -1,0 +1,470 @@
+---
+title: "route-level-predictors"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(keyring)
+library(stringr)
+library(progressr)
+
+# GIS and Mapping
+library(sf)
+library(tmap)
+
+# Census
+library(tidycensus)
+```
+
+# Functions
+
+## Traffic Function
+
+```{r}
+# Old, inefficient function
+get_weighted_traffic_average <- function(row_stop_id, row_trip_id) {
+  stop_shape <- stops_joined %>%
+    filter(stop_id == row_stop_id,
+           trip_id == row_trip_id)
+  buffered_route <- st_buffer(stop_shape, dist = 1)
+  intersection <- st_intersection(congestion_spatial, buffered_route)
+  intersection_line <- st_collection_extract(intersection, "LINESTRING")
+  
+  # Note this is avg of traffic data we have, so not all routes have complete coverage
+  processed_intersection <- intersection_line %>%
+    mutate(length = units::set_units(st_length(geometry), "ft", mode = "standard")) %>% # Calculate length of each segment
+    filter(length > units::set_units(5, "ft", mode = "standard")) # Filtering out any segment less than 5ft in length to remove noise
+
+  total_length <- sum(processed_intersection$length)
+  
+  processed_intersection <- processed_intersection %>%
+    mutate(wgt_traffic = AWDT * (length / total_length))
+  
+  segment_traffic <- as.numeric(sum(processed_intersection$wgt_traffic))
+  return(segment_traffic)
+}
+```
+
+## Ridership Function
+
+```{r}
+# Old, inefficient function
+get_weighted_transit_ridership <- function(row_stop_id, row_trip_id) {
+  stop_shape <- stops_joined %>%
+    filter(stop_id == row_stop_id,
+           trip_id == row_trip_id)
+  buffered_route <- st_buffer(stop_shape, dist = 2640) # approximate 0.25 mile buffer (in feet)
+  
+  # Filter ACS polygons to include only ones with over 50% within buffer
+  blocks_filtered <- kcacs_blocks %>%
+    filter(lengths(st_intersects(., buffered_route)) > 0) %>%
+    rowwise() %>%
+    mutate(
+      inter_geom = list(st_intersection(geometry, buffered_route)),
+      inter_area = {
+        ig <- inter_geom[]
+        if(length(ig) == 0 || all(st_is_empty(ig))) {
+          0
+          } else {
+            sum(st_area(ig))
+            }
+        },
+      total_area = st_area(geometry),
+      overlap_ratio = as.numeric(inter_area / total_area)
+      ) %>%
+    ungroup() %>%
+    filter(overlap_ratio >= 0.5)
+  
+  # Weighted average
+  total_population <- sum(blocks_filtered$tot_popE)
+  
+  blocks_filtered <- blocks_filtered %>%
+    mutate(wgt_pop = transp_mthd_public_perc * (tot_popE/total_population))
+  
+  route_ridership <- as.double(sum(blocks_filtered$wgt_pop))
+  return(route_ridership)
+}
+```
+
+# Loading Data
+
+## Load route_ids
+
+```{r}
+routes <- read.csv(here("Predictor Data Sets",
+                        "gtfs-static-files/routes.txt")) %>%
+  filter(agency_id == 1) %>% # Filtering to only include King County Metro agency
+  select(route_id, route_short_name) %>%
+  mutate(rapid_ride = case_when(
+    str_detect(route_short_name, "Line") ~ 1,
+    TRUE ~ 0
+  )) %>%
+  replace_na(list(rapid_ride = 0)) %>%
+  mutate(route_id = as.numeric(route_id),
+         rapid_ride = as.factor(rapid_ride)) %>%
+  select(route_id, rapid_ride, route_short_name)
+  
+routes
+```
+
+## Load route shapes, confirm CRS
+
+```{r}
+# Current CRS NAD83
+kc_route_shp <- st_read(here("Predictor Data Sets",
+                           "KCMetro_Transit_Lines",
+                           "Transit_Routes_for_King_County_Metro___transitroute_line.shp")) %>%
+  select(ROUTE_ID, geometry) %>%
+  distinct(ROUTE_ID, .keep_all = TRUE)
+
+# Joining
+routes_shp <- kc_route_shp %>%
+  left_join(routes,
+            by = c("ROUTE_ID" = "route_id")) %>%
+  st_transform(crs = 2285)
+
+routes_shp
+```
+
+## Load spatial traffic shapefile
+
+```{r}
+# CRS is NAD83
+congestion_spatial <- st_read(here("Predictor Data Sets",
+                                   "2018_Traffic_Flow_Counts-shp",
+                                   "2018_Traffic_Flow_Counts.shp")) %>%
+  select(AWDT, geometry) %>%
+  st_transform(crs = 2285)
+```
+
+# Load ACS Ridership
+
+```{r}
+# Using keyring package to keep my API key hidden
+tidycensus_api_key <- key_get(service = "tidycensus_API", username = "my_tidycensus")
+census_api_key(tidycensus_api_key)
+
+ACSlist <- load_variables(2022, "acs5", cache = TRUE)
+
+# Projection is NAD83(!!)
+kingcounty_acs_blocks <- get_acs(state = "WA",
+                                 county = "King",
+                                 geography = "block group",
+                                 variables = c(tot_pop = "B01003_001",
+                                               transp_basetotal = "B08134_001",
+                                               transp_mthd_public = "B08134_061",
+                                               race_base = "B02001_001",
+                                               race_white = "B02001_002",
+                                               median_HHI = "B19013_001"),
+                                 geometry = TRUE,
+                                 keep_geo_vars = TRUE,
+                                 year = 2023,
+                                 output = "wide") %>%
+  filter(ALAND != 0) %>% # Filter tracts that are 100% water
+  mutate(GEOID = as.double(GEOID))
+
+kcacs_blocks <- kingcounty_acs_blocks %>%
+  mutate(ALAND_miles = ALAND/2589988) %>% # Converting sq meters to sq miles
+  mutate(transp_mthd_public_perc = transp_mthd_publicE / transp_basetotalE,
+         pop_density = tot_popE / ALAND_miles,
+         white_perc = race_whiteE / race_baseE,
+         median_HHI = median_HHIE) %>%
+  select(tot_popE,
+         pop_density,
+         transp_mthd_public_perc,
+         white_perc,
+         median_HHI,
+         geometry) %>%
+  st_transform(crs = 2285)
+```
+
+```{r}
+# Filtering dataset to work with my spatial congestion dataset + include RapidRide C, D, G lines
+ylims <- c(184191.9, 271524.6)
+xlims <- c(1250336, 1293480)
+box_coords <- tibble(x = xlims, y = ylims) %>% 
+  st_as_sf(coords = c("x", "y")) %>% 
+  st_set_crs(st_crs(congestion_spatial))
+
+bounding_box <- st_bbox(box_coords) %>% st_as_sfc()
+
+routes_subset <- st_filter(routes_shp, bounding_box, .predicate = st_within)
+routes_inbb <- routes_subset$ROUTE_ID
+```
+
+```{r}
+# Loading trip data (directionality)
+trips <- read.csv("../Predictor Data Sets/gtfs-static-files/trips.txt") %>%
+  select(route_id, trip_id, direction_id, shape_id, service_id) %>%
+  filter(route_id %in% routes_inbb)
+
+# Loading spatial data for routes
+shapes <- read.csv("../Predictor Data Sets/gtfs-static-files/shapes.txt") %>%
+  arrange(shape_id, shape_pt_sequence) %>%
+  st_as_sf(coords = c("shape_pt_lon", "shape_pt_lat"), crs = 4326) %>%
+  group_by(shape_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING") %>%
+  st_transform(2285)
+
+# Loading stop sequence for each trip
+stop_times <- read.csv("../Predictor Data Sets/gtfs-static-files/stop_times.txt") %>%
+  select(trip_id, stop_id, shape_dist_traveled, arrival_time) %>%
+  mutate(shape_dist_traveled = shape_dist_traveled) %>% 
+  mutate(stop_id = as.character(stop_id),
+         trip_id = as.character(trip_id)) %>%
+  distinct(stop_id, trip_id,
+           .keep_all = TRUE)
+```
+
+# Return Direction-Conscious Linestring for TripIDs
+
+```{r}
+trips_withshapes <- trips %>%
+  select(route_id, trip_id, shape_id, direction_id) %>%
+  distinct(route_id, trip_id, shape_id, direction_id) %>%
+  left_join(shapes,
+             by = c("shape_id" = "shape_id")) %>%
+  mutate(geometry = case_when(
+    direction_id == 1 ~ st_reverse(geometry),
+    TRUE ~ geometry),
+    trip_id = as.character(trip_id)
+  ) %>%
+  st_as_sf() %>%
+  st_set_crs(st_crs(shapes))
+```
+
+```{r}
+stops_clippedshp <- stop_times %>%
+  select(!arrival_time) %>%
+  mutate(trip_id = as.character(trip_id),
+         shape_dist_traveled = case_when(
+           shape_dist_traveled == 0 ~ 1,
+           TRUE ~ shape_dist_traveled
+         )) %>%
+  right_join(trips_withshapes,
+            by = c("trip_id" = "trip_id")) %>%
+  select(route_id, trip_id, stop_id, shape_dist_traveled, geometry) %>%
+  mutate(
+    route_id = as.numeric(route_id),
+    total_length = as.numeric(st_length(geometry)),
+    # Normalize distance to [0,1] fraction
+    to_fraction = pmin(shape_dist_traveled / total_length, 1)
+  ) %>%
+  rowwise() %>% 
+  mutate(
+    geometry = lwgeom::st_linesubstring(
+      geometry,
+      from = 0,
+      to = to_fraction,
+      normalize = FALSE
+    )
+  ) %>%
+  ungroup() %>%
+  select(route_id, trip_id, stop_id, shape_dist_traveled, geometry) %>%
+  st_as_sf() %>%
+  st_set_crs(st_crs(trips_withshapes))
+
+stops_joined <- stops_clippedshp %>%
+  left_join(routes, 
+            by = c("route_id" = "route_id")) %>%
+  select(!route_short_name) %>%
+  st_as_sf() %>%
+  st_set_crs(st_crs(trips_withshapes))
+```
+
+# Final Dataset
+
+```{r}
+write_csv(stops_joined, "../predictor_tables/stops_joined.csv")
+```
+
+
+```{r}
+with_progress({
+  # Calculate total unique combinations for progress
+  unique_combos <- stops_joined %>%
+    st_drop_geometry() %>%
+    select(stop_id, trip_id) %>%
+    distinct()
+    
+  p <- progressor(steps = nrow(unique_combos))
+  
+  # Group by stop_id and trip_id
+  grouped_stops <- stops_joined %>%
+    group_by(stop_id, trip_id) %>%
+    group_split()
+  
+  # Process each group and track progress
+  results <- vector("list", length(grouped_stops))
+  
+  for (i in seq_along(grouped_stops)) {
+    group <- grouped_stops[[i]]
+    
+    # Buffer the geometry
+    buffered_route <- st_buffer(group, dist = 1)
+    intersection <- st_intersection(congestion_spatial, buffered_route)
+    intersection_line <- st_collection_extract(intersection, "LINESTRING")
+    
+    # Calculate weighted traffic
+    if (nrow(intersection_line) > 0) {
+      processed_intersection <- intersection_line %>%
+        mutate(length = units::set_units(st_length(geometry), "ft", mode = "standard")) %>%
+        filter(length > units::set_units(5, "ft", mode = "standard"))
+        
+      if (nrow(processed_intersection) > 0) {
+        total_length <- sum(processed_intersection$length)
+        processed_intersection <- processed_intersection %>%
+          mutate(wgt_traffic = AWDT * (length / total_length))
+        segment_traffic <- as.numeric(sum(processed_intersection$wgt_traffic))
+      } else {
+        segment_traffic <- NA_real_
+      }
+    } else {
+      segment_traffic <- NA_real_
+    }
+    
+    # Store result
+    group$spatial_traffic <- segment_traffic
+    results[[i]] <- group
+    
+    # Update progress
+    p()
+  }
+  
+  # Combine results
+  stop_predictors_a <- bind_rows(results) %>%
+    st_set_crs(st_crs(stops_clippedshp)) %>%
+    filter(!is.na(stop_id))
+})
+
+
+write_csv(stop_predictors_a, "../predictor_tables/spatial_predictors_a.csv")
+```
+
+```{r}
+with_progress({
+  # Calculate total unique combinations for progress tracking
+  unique_combos <- stop_predictors_a %>%
+    st_drop_geometry() %>%
+    select(stop_id, trip_id) %>%
+    distinct()
+    
+  p <- progressor(steps = nrow(unique_combos))
+  
+  # Process in groups
+  grouped_data <- stop_predictors_a %>%
+    group_by(stop_id, trip_id) %>%
+    group_split()
+  
+  results <- vector("list", length(grouped_data))
+  
+  for (i in seq_along(grouped_data)) {
+    group <- grouped_data[[i]]
+    
+    # Create buffer
+    buffered_route <- st_buffer(group, dist = 2640)
+    
+    # Find intersecting blocks
+    blocks_intersect <- kcacs_blocks[unlist(st_intersects(kcacs_blocks, buffered_route)), ]
+    
+    if (nrow(blocks_intersect) > 0) {
+      # Calculate overlap
+      blocks_filtered <- blocks_intersect %>%
+        # First identify which geometries actually intersect
+        mutate(intersects = lengths(st_intersects(geometry, buffered_route)) > 0) %>%
+        filter(intersects) %>%
+        # Then calculate intersection areas only for those that do intersect
+        mutate(
+          inter_area = as.numeric(st_area(st_intersection(geometry, buffered_route))),
+          total_area = st_area(geometry),
+          overlap_ratio = as.numeric(inter_area / total_area)
+        ) %>%
+        filter(overlap_ratio >= 0.5)
+      
+      if (nrow(blocks_filtered) > 0) {
+        # Calculate weighted ridership
+        total_population <- sum(blocks_filtered$tot_popE)
+        
+        if (total_population > 0) {
+          blocks_filtered <- blocks_filtered %>%
+            mutate(route_ridership = transp_mthd_public_perc * (tot_popE/total_population),
+                   wgt_pop_density = pop_density * (tot_popE/total_population),
+                   wgt_white_perc = white_perc * (tot_popE/total_population),
+                   wgt_median_HHI = median_HHI * (tot_popE/total_population))
+          
+          route_ridership <- as.double(sum(blocks_filtered$route_ridership))
+          wgt_pop_density <- as.double(sum(blocks_filtered$wgt_pop_density))
+          wgt_white_perc <- as.double(sum(blocks_filtered$wgt_white_perc))
+          wgt_median_HHI <- as.double(sum(blocks_filtered$wgt_median_HHI))
+        } else {
+          route_ridership <- 0
+          wgt_pop_density <- 0
+          wgt_white_perc <- 0
+          wgt_median_HHI <- 0
+        }
+      } else {
+        route_ridership <- 0
+        wgt_pop_density <- 0
+        wgt_white_perc <- 0
+        wgt_median_HHI <- 0
+      }
+    } else {
+      route_ridership <- 0
+      wgt_pop_density <- 0
+      wgt_white_perc <- 0
+      wgt_median_HHI <- 0
+    }
+    
+    # Add result to the group
+    group$route_ridership <- route_ridership
+    group$wgt_pop_density <- wgt_pop_density
+    group$wgt_white_perc <- wgt_white_perc
+    group$wgt_median_HHI <- wgt_median_HHI
+    results[[i]] <- group
+    
+    # Update progress
+    p()
+  }
+  
+  # Combine results
+  stop_predictors <- bind_rows(results) %>%
+    # Maintain the same CRS as the input
+    st_set_crs(st_crs(stop_predictors_a)) %>%
+    filter(!is.na(stop_id))
+})
+
+stop_predictors <- stop_predictors %>%
+  dplyr::select(!geometry)
+
+write_csv(stop_predictors, "../predictor_tables/spatial_predictors.csv")
+```
+
+# Standardizing Final Dataset
+
+```{r}
+# Standardize function (note that it's 2*sd)
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+stop_pred_std <- stop_predictors %>%
+  select(route_id, rapid_ride, spatial_traffic, ridership_perc, geometry) %>%
+  mutate(rapid_ride = as.numeric(rapid_ride)) %>%
+  mutate(across(c("spatial_traffic"), standardize))
+
+write_csv(stop_pred_std, "../predictor_tables/spatial_pred_std.csv")
+```
+
+
