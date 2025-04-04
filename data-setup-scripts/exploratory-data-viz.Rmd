@@ -20,134 +20,388 @@ library(patchwork)
 library(ggridges)
 library(GGally)
 library(rstanarm)
-library(lme4)
-library(arm)
 
 # GIS and Mapping
 library(sf)
 library(tmap) 
 ```
 
+# Loading Data MAKE SURE THAT RAPID_RIDE IS CODED CORRECTLY!!!
+```{r}
+data <- read_csv(here("predictor_tables","final_data.csv")) %>%
+  mutate(
+    g_route_id = as.factor(g_route_id), 
+    stop_id = as.factor(stop_id), 
+    trip_id = as.factor(trip_id), 
+    rapid_ride = as.numeric(rapid_ride), 
+    arrival_delay = as.numeric(arrival_delay), 
+    abs_dev = as.numeric(abs_dev),
+    shape_dist_traveled = as.numeric(shape_dist_traveled), 
+    avg_traffic_dayhour = as.numeric(avg_traffic_dayhour), 
+    spatial_congestion = as.numeric(spatial_congestion),
+    pop_density = as.numeric(pop_density),
+    route_ridership = as.numeric(route_ridership),
+    perc_white = as.numeric(perc_white),
+    median_hhi = as.numeric(median_hhi),
+    g_weekday = as.numeric(g_weekday), 
+    g_hr = as.numeric(g_hr),
+    g_peak = as.factor(g_peak),
+    g_weekend = as.factor(g_weekend)
+  )
+```
+
+# Descriptive Stats
+
+## Main Descriptive Stats, by treatment group
+```{r}
+data_desc = data %>%
+  select(
+    rapid_ride, 
+    arrival_delay, 
+    abs_dev,
+    shape_dist_traveled, 
+    avg_traffic_dayhour, 
+    spatial_congestion,
+    pop_density,
+    route_ridership,
+    perc_white,
+    median_hhi,
+    g_weekday, 
+    g_hr
+  )
+
+desc_overall <- data %>%
+  summarize(across(everything()),
+    mean = mean,
+    stddev = sd,
+    min = min,
+    quartile_1 = ~quantile(., 0.25),
+    median = median,
+    quartile_3 = ~quantile(., 0.75),
+    max = max,
+  )
+
+desc_groups <- data %>%
+  group_by(rapid_ride) %>%
+  summarize(across(everything()),
+    mean = mean,
+    stddev = sd,
+    min = min,
+    quartile_1 = ~quantile(., 0.25),
+    median = median,
+    quartile_3 = ~quantile(., 0.75),
+    max = max,
+  )
+
+desc_table <- rbind(desc_groups, desc_overall)
+
+# Need a prettier printing soluation
+desc_table
+```
+
+## Assessing Balance for Causal Inference
+```{r}
+# Function to get balance diagnostics
+# From https://github.com/gperrett/stan4bart-study/blob/master/get_balance.R
+# Linked in Dorie et al 2022
+get_balance <- function(rawdata, treat,estimand="ATT"){
+  if(missing(rawdata)) stop("rawdata is required")
+  if(missing(treat)) stop("treatment vector (treat) is required")
+  cat("Balance diagnostics assume that the estimand is the",estimand,"\n")
+  #
+  #raw.dat <- data.frame(rawdata, treat = treat)
+  covnames <- colnames(rawdata)
+  if (is.null(covnames)){
+    cat("No covariate names provided.  Generic names will be generated.")
+    covnames = paste("v",c(1:ncol(rawdata)),sep="")
+  }
+  K <- length(covnames)
+  diff.means <- matrix(NA, K, 5)
+  var.t <- numeric(K)
+  var.c <- numeric(K)
+  std.denom <- numeric(K)
+  binary <- rep(1,K)
+  
+  for (i in 1:K) {
+    # separate means by group
+    diff.means[i, 1] <- mean(rawdata[treat==1, i])
+    diff.means[i, 2] <- mean(rawdata[treat==0, i])
+    # separate variances by group == only used as input to calculations below
+    var.t[i] <- var(rawdata[(treat == 1), i])
+    var.c[i] <- var(rawdata[(treat == 0), i])
+    # denominator in standardized difference calculations
+    if(estimand=="ATE"){std.denom[i] <- sqrt((var.t[i]+var.c[i])/2)}
+    else{
+      std.denom[i] <- ifelse(estimand=="ATT",sqrt(var.t[i]),sqrt(var.c[i]))
+    }
+    # difference in means
+    diff.means[i, 3] <- diff.means[i, 1] - diff.means[i, 2]
+    # standardized difference in means (sign intact)
+    diff.means[i, 4] <- abs(diff.means[i, 3]/std.denom[i])
+    if(length(unique(rawdata[,covnames[i]]))>2){
+      binary[i] = 0
+      diff.means[i, 5] <- sqrt(var.c[i]/var.t[i])
+    }
+  }
+  
+  dimnames(diff.means) <- list(covnames, c("treat", "control", "unstd.diff",
+                                           "abs.std.diff", "ratio"))
+  
+  
+  return(diff.means)
+}
+
+# Setting up data (covariates in a matrix, treatment vector)
+# Removed factor vars
+X <- as.matrix(data_desc %>% select(!rapid_ride))
+y <- data_desc$rapid_ride
+
+# Running the function
+balance_table <- get_balance(rawdata = X, treat = y, estimand = "ATT")
+
+# Need a prettier printing soluation
+balance_table
+```
+
+# Visualizations
+
+## Maps
+
+### Routes + Stops in the City
+```{r}
 # Loading Data
-```{r echo = FALSE}
-stop_pred_std <- read_csv(here("predictor_tables","stop_pred_std.csv"), show_col_types = FALSE)
-route_pred_std <- read_csv(here("predictor_tables","route_pred_std.csv"), show_col_types = FALSE)
+routes_inscope <- unique(data$g_route_id)
+stops_inscope <- unique(data$stop_id)
+routes_rapidride <- data %>%
+  filter(rapid_ride == 1)
+routes_rapidride <- unique(routes_rapidride$g_route_id)
+
+routes_shp <- st_read(here("Predictor Data Sets",
+                           "KCMetro_Transit_Lines",
+                           "Transit_Routes_for_King_County_Metro___transitroute_line.shp")) %>%
+  filter(route_id %in% routes_inscope)
+
+routes_rapidride_shp <- routes_shp %>%
+  filter(route_id %in% routes_rapidride)
+
+stops_shp <- st_read(here("Predictor Data Sets",
+                          "KCMetro_Transit_Stops",
+                          "Transit_Stops_for_King_County_Metro___transitstop_point.shp")) %>%
+  filter(stop_id %in% stops_inscope)
+
+# Mapping
+routestop_map <- tm_shape(routes_shp) + tm_lines(col = "blue") +
+  tm_shape(routes_rapidride_shp) + tm_lines(col = "red") + 
+  tm_shape(stops_shp) + tm_dots(col = "yellow") +
+  tm_basemap("CartoDB.PositronNoLabels")
+
+routestop_map
 ```
 
-# Joining Data Tables
+### Traffic in the City
 ```{r}
-table <- stop_pred_std %>%
-  inner_join(route_pred_std,
-             by = c("route_id" = "ROUTE_ID")) %>%
-  filter(!is.na(arrival_delay)) %>%
-  mutate(rapid_ride = as.factor(rapid_ride)) %>%
-  mutate(route_id = as.factor(route_id),
-         weekday = as.factor(weekday),
-         hr = as.factor(hr))
+# Loading Data
+congestion_spatial <- st_read(here("Predictor Data Sets",
+                                   "2018_Traffic_Flow_Counts-shp",
+                                   "2018_Traffic_Flow_Counts.shp")) %>%
+  select(AWDT, geometry) %>%
+  st_transform(crs = 2285)
+
+# Mapping
+traffic_map <- tm_shape(congestion_spatial) + tm_lines(col = AWDT) + 
+  tm_basemap("CartoDB.PositronNoLabels")
+
+traffic_map
 ```
 
-# Distribution of Arrival Times
+### Faceted Maps of ACS Variables
 ```{r}
-# Setting up table for correlation plots
-table_1 <- table %>%
-  dplyr::select(abs_dev, arrival_delay, shape_dist_traveled, avg_traffic_dayhour, rapid_ride, spatial_traffic, ridership_perc, hr, route_id) %>%
-  relocate(rapid_ride, .after = ridership_perc)
+# Loading Data
+# Using keyring package to keep my API key hidden
+tidycensus_api_key <- key_get(service = "tidycensus_API", username = "my_tidycensus")
+census_api_key(tidycensus_api_key)
 
-plot <- ggplot(table_1, aes(x = arrival_delay, color = rapid_ride)) + geom_density()
+ACSlist <- load_variables(2022, "acs5", cache = TRUE)
 
-plot
+# Projection is NAD83(!!)
+kingcounty_acs_blocks <- get_acs(state = "WA",
+                                 county = "King",
+                                 geography = "block group",
+                                 variables = c(tot_pop = "B01003_001",
+                                               transp_basetotal = "B08134_001",
+                                               transp_mthd_public = "B08134_061",
+                                               race_base = "B02001_001",
+                                               race_white = "B02001_002",
+                                               median_HHI = "B19013_001"),
+                                 geometry = TRUE,
+                                 keep_geo_vars = TRUE,
+                                 year = 2023,
+                                 output = "wide") %>%
+  filter(ALAND != 0) %>% # Filter tracts that are 100% water
+  mutate(GEOID = as.double(GEOID))
+
+kcacs_blocks <- kingcounty_acs_blocks %>%
+  mutate(ALAND_miles = ALAND/2589988) %>% # Converting sq meters to sq miles
+  mutate(transp_mthd_public_perc = transp_mthd_publicE / transp_basetotalE,
+         pop_density = tot_popE / ALAND_miles,
+         white_perc = race_whiteE / race_baseE,
+         median_HHI = median_HHIE) %>%
+  select(tot_popE,
+         pop_density,
+         transp_mthd_public_perc,
+         white_perc,
+         median_HHI,
+         geometry) %>%
+  st_transform(crs = 2285)
+
+# Mapping
+popdensity_map <- tm_shape(kcacs_blocks) + tm_polygons(col = pop_density) + 
+  tm_basemap("CartoDB.PositronNoLabels")
+
+ridership_map <- tm_shape(kcacs_blocks) + tm_polygons(col = transp_mthd_public_perc) + 
+  tm_basemap("CartoDB.PositronNoLabels")
+
+whiteperc_map <- tm_shape(kcacs_blocks) + tm_polygons(col = white_perc) + 
+  tm_basemap("CartoDB.PositronNoLabels")
+
+medianHHI_map <- tm_shape(kcacs_blocks) + tm_polygons(col = median_HHI) + 
+  tm_basemap("CartoDB.PositronNoLabels")
+
+popdensity_map + ridership_map + whiteperc_map + medianHHI_map
 ```
 
-# Plots
+## Graphs
 
-## Shape Distance Travelled vs. Arrival Delay
-
+### Traffic: Average Traffic by Day+Hour
 ```{r}
-ggplot(data = table_1, 
-       aes(x = shape_dist_traveled,
-           y = abs_dev,
-           color = rapid_ride)) +
+data_trafficdayhour <- desc_data %>%
+  select(avg_traffic_dayhour, g_weekday, g_hr)
+
+avgtraffic_plot <- ggplot(data = data_trafficdayhour,
+                          aes(x = g_hr, 
+                              y = avg_traffic_dayhour,
+                              color = g_weekday)) + 
+  geom_line(linetype = g_weekday)
+```
+
+### Graphs Per Predictor vs. Absolute Deviation
+```{r}
+# shape_dist_traveled = as.numeric(shape_dist_traveled)
+disttraveled_plot <- ggplot(data = data,
+                            aes(x = shape_dist_traveled,
+                                y = abs_dev,
+                                color = rapid_ride)) +
   geom_point()
-```
 
-## Traffic (time) vs. Arrival Delay
-
-```{r}
-ggplot(data = table_1, 
-       aes(x = avg_traffic_dayhour,
-           y = abs_dev,
-           color = rapid_ride)) +
+# avg_traffic_dayhour = as.numeric(avg_traffic_dayhour)
+timetraffic_plot <- ggplot(data = data,
+                            aes(x = avg_traffic_dayhour,
+                                y = abs_dev,
+                                color = rapid_ride)) +
   geom_point()
-```
 
-## Traffic (spatial) vs. Arrival Delay
-
-```{r}
-ggplot(data = table_1, 
-       aes(x = spatial_traffic,
-           y = abs_dev,
-           color = rapid_ride)) +
+# spatial_congestion = as.numeric(spatial_congestion)
+spacetraffic_plot <- ggplot(data = data,
+                            aes(x = spatial_congestion,
+                                y = abs_dev,
+                                color = rapid_ride)) +
   geom_point()
-```
 
-## Ridership Percentage vs. Arrival Delay
-
-```{r}
-ggplot(data = table_1, 
-       aes(x = ridership_perc,
-           y = abs_dev,
-           color = rapid_ride)) +
+# pop_density = as.numeric(pop_density)
+popdensity_plot <- ggplot(data = data,
+                            aes(x = pop_density,
+                                y = abs_dev,
+                                color = rapid_ride)) +
   geom_point()
+
+# route_ridership = as.numeric(route_ridership)
+ridership_plot <- ggplot(data = data,
+                            aes(x = route_ridership,
+                                y = abs_dev,
+                                color = rapid_ride)) +
+  geom_point()
+
+# perc_white = as.numeric(perc_white)
+percwhite_plot <- ggplot(data = data,
+                            aes(x = perc_white,
+                                y = abs_dev,
+                                color = rapid_ride)) +
+  geom_point()
+
+# median_hhi = as.numeric(median_hhi)
+medianhhi_plot <- ggplot(data = data,
+                            aes(x = median_hhi,
+                                y = abs_dev,
+                                color = rapid_ride)) +
+  geom_point()
+
+# g_weekday = as.numeric(g_weekday)
+weekday_plot <- ggplot(data = data,
+                            aes(x = g_weekday,
+                                y = abs_dev,
+                                color = rapid_ride)) +
+  geom_jitter(width = 0.5)
+
+# g_hr = as.numeric(g_hr)
+hour_plot <- ggplot(data = data,
+                            aes(x = g_hr,
+                                y = abs_dev,
+                                color = rapid_ride)) +
+  geom_jitter(width = 0.5)
+
+(disttraveled_plot | timetraffic_plot | spacetraffic_plot) /
+(popdensity_plot | ridership_plot | percwhite_plot) /
+(medianhhi_plot | weekday_plot | hour_plot)
 ```
 
+## Raw Estimates of Average Absolute Deviation w/ Error
+
+### RapidRide vs. Non-RapidRide
 ```{r}
-summary_stats <- table %>%
-  mutate(rapid_ride = as.numeric(rapid_ride) - 1) %>%
-  group_by(route_id) %>%
+rapidride_stats <- table %>%
+  group_by(rapid_ride) %>%
   summarize(
     mean = mean(abs_dev, na.rm = TRUE),
     se = sd(abs_dev, na.rm = TRUE) / sqrt(n()),
-    n = n(),
-    rapid_ride = as.factor(mean(rapid_ride))
+    n = n()
     )
 
-ggplot(summary_stats, aes(x = route_id, y = mean, color = rapid_ride)) +
+ggplot(summary_stats, aes(x = rapid_ride, y = mean, color = rapid_ride)) +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
   labs(
-    title = "Mean Outcome by Factor Level",
+    title = "Mean Absolute Deviation by RapidRide Status",
     subtitle = "Error bars represent ± 1 standard error",
-    x = "Factor Level",
+    x = "RapidRide Status",
     y = "Mean Outcome"
   ) +
   theme_minimal() +
   coord_flip()
 ```
 
+### By Route
 ```{r}
-fit <- lmer(abs_dev ~ rapid_ride + ridership_perc + spatial_traffic + 
-                    avg_traffic_dayhour + shape_dist_traveled + route_id + 
-              (1 + rapid_ride | weekday/hr),
-                  data = table)
+route_stats <- table %>%
+  group_by(route_id) %>%
+  summarize(
+    mean = mean(abs_dev, na.rm = TRUE),
+    se = sd(abs_dev, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    rapid_ride = as.factor(rapid_ride)
+    )
+
+ggplot(summary_stats, aes(x = route_id, y = mean, color = rapid_ride)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  labs(
+    title = "Mean Absolute Deviation by Route",
+    subtitle = "Error bars represent ± 1 standard error",
+    x = "Route ID",
+    y = "Mean Outcome"
+  ) +
+  theme_minimal() +
+  coord_flip()
 ```
-
-```{r}
-display(fit)
-```
-
-```{r}
-fit2 <- lmer(abs_dev ~ ridership_perc + 
-               spatial_traffic + 
-               avg_traffic_dayhour + 
-               shape_dist_traveled + rapid_ride + route_id +
-              (1 | weekday/hr),
-                  data = table)
-
-display(fit2)
-```
-
-
-
 
 
 
