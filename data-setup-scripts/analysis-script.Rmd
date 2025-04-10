@@ -5,4 +5,191 @@ date: "`r Sys.Date()`"
 output: html_document
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(patchwork)
+library(modelsummary)
+library(knitr)
+
+# Modeling
+library(stan4bart)
+library(bartCause)
+library(rstanarm)
+library(bayesplot)
+```
+
+# Loading Data
+```{r}
+train_df <- read_csv(here("cloud-scripts","train_data.csv")) %>%
+  mutate(
+    abs_dev = ifelse(
+    abs_dev < 80000, abs_dev,
+    abs(abs_dev - 86400)
+    ))
+test_df <- read_csv(here("cloud-scripts","test_data.csv")) %>%
+  mutate(
+    abs_dev = ifelse(
+    abs_dev < 80000, abs_dev,
+    abs(abs_dev - 86400)
+    ))
+
+# Make sure all variables are in the correct format
+```
+
+# Basic Modeling
+
+## Single Binary Variable Comparison
+```{r}
+# First, a simple comparison of means
+fit_binary <- stan_glm(log(abs_dev + 1) ~ rapid_ride,
+                       data = train_df,
+                       refresh = FALSE,
+                       cores = 4)
+
+# Second, fit a model using simple linear terms for each covariate
+fit_multivariate <- stan_glm(log(abs_dev + 1) ~ rapid_ride + 
+                               shape_dist_traveled + 
+                               avg_traffic_dayhour + 
+                               spatial_congestion +
+                               pop_density + 
+                               route_ridership + 
+                               perc_white + 
+                               median_hhi + 
+                               g_weekday + 
+                               g_hr,
+                       data = train_df,
+                       refresh = FALSE,
+                       cores = 4)
+
+# Third, fit a model with interactions between related variables and allow treatment effects to vary by group
+fit_int <- stan_glm(log(abs_dev + 1) ~ rapid_ride + 
+                         rapid_ride + 
+                         shape_dist_traveled + 
+                         avg_traffic_dayhour + 
+                         spatial_congestion +
+                         pop_density + 
+                         route_ridership + 
+                         perc_white + 
+                         median_hhi +
+                         spatial_congestion:avg_traffic_dayhour + 
+                         shape_dist_traveled:avg_traffic_dayhour + 
+                         shape_dist_traveled:spatial_congestion + 
+                         rapid_ride:g_peak + 
+                         rapid_ride:g_weekend +
+                         rapid_ride:spatial_congestion + 
+                         rapid_ride:route_ridership + 
+                         rapid_ride:avg_traffic_dayhour,
+                       data = train_df,
+                       refresh = FALSE,
+                       cores = 4)
+
+# Table of Coefficients
+models <- list(fit_binary, fit_multivariate, fit_int)
+print(fit_binary, digits = 5)
+print(fit_multivariate, digits = 5)
+print(fit_int, digits = 5)
+```
+
+```{r}
+# Validate models on Test Set, compute RMSE (GIVING NEGATIVE NUMBERS!!)
+actuals <- log(test_df$abs_dev + 1)
+
+binary_pred <- predict(fit_binary, newdata = test_df)
+multivariate_pred <- predict(fit_multivariate, newdata = test_df)
+int_pred <- predict(fit_int, newdata = test_df)
+
+binary_rmse <- sqrt(mean((binary_pred - actuals)^2))
+multivariate_rmse <- sqrt(mean((multivariate_pred - actuals)^2))
+int_rmse <- sqrt(mean((int_pred - actuals)^2))
+
+rmse_df <- tibble(
+  Model = c("Binary Linear", "Multivariate Linear", "Hierarchical Linear"),
+  RMSE = c(binary_rmse, multivariate_rmse, int_rmse)
+)
+
+kable(rmse_df)
+```
+
+```{r}
+# Density Curves from Posterior Simulations
+binary_rep <- posterior_predict(fit_binary, newdata = test_df, draws = 100)
+multivariate_rep <- posterior_predict(fit_multivariate, newdata = test_df, draws = 100)
+int_rep <- posterior_predict(fit_int, newdata = test_df, draws = 100)
+
+kerneldensity_binary <- ppc_dens_overlay(actuals, binary_rep[1:100, ]) + scale_y_continuous(breaks=NULL)
+kerneldensity_multivariate <- ppc_dens_overlay(actuals, multivariate_rep[1:100, ]) + scale_y_continuous(breaks=NULL)
+kerneldensity_int <- ppc_dens_overlay(actuals, int_rep[1:100, ]) + scale_y_continuous(breaks=NULL)
+
+(kerneldensity_binary | kerneldensity_multivariate | kerneldensity_int)
+```
+
+```{r}
+kerneldensity_int
+```
+
+
+```{r}
+# Calculate SATT for Linear MLM (ASSUMING THIS IS THE BEST-PERFORMING MODEL)
+
+# Set up counterfactual dataset
+treated_df <- test_df %>% filter(rapid_ride == 1)
+counterfactual_df <- treated_df
+counterfactual_df$rapid_ride <- 0
+
+# Posterior Draws
+n_draws <- 1000
+y1_pred_int <- posterior_epred(fit_int, newdata = treated_df)
+y0_pred_int <- posterior_epred(fit_int, newdata = counterfactual_df)
+
+# Individual Effects
+ind_effects_int <- y1_pred_int - y0_pred_int
+
+# Posterior Distribution of SATT
+satt_dist_int <- rowMeans(ind_effects_int)
+
+# Summary Stats
+satt_est_int <- median(satt_dist_int)
+satt_ci_int <- quantile(satt_dist_int, probs = c(0.025, 0.975))
+
+print(paste("SATT :", satt_est_int, "Confidence Interval:", satt_ci_int[1], satt_ci_int[2]), digits = 4)
+```
+
+```{r}
+# Calculate SATT by groupings
+```
+
+# Hierarchical BART Model (via stan4bart)
+```{r}
+# Loading Data
+fit_stan4bart <- load(here("cloud-scripts","stan4bart_rapidride_model.RData"))
+```
+
+## Model Validation
+```{r}
+# Validate on Test Set, compute RMSE (use predict)
+# Examine the options within predict(): 
+    # "ev" - Expected value (default)
+    # "ppd" - Posterior predictive distribution <- use to get comparable output to posterior_predict()
+    # "indiv.fixef" - Individual fixed effects
+    # "indiv.ranef" - Individual random effects
+    # "indiv.bart" - Individual BART component
+```
+
+## Counterfactual Estimations
+```{r}
+# If we've validated the model, I think it's ok to just do this on the training set
+# Another/secondary approach could be to create a fake dataset with test data and compare (simulation!)
+```
+
+# Results Visualization
+
 

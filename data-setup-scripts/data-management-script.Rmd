@@ -378,7 +378,6 @@ subset_clipped <- subset_withshapes %>%
   select(!route_id.y) %>%
   rename("route_id" = "route_id.x") %>%
   mutate(
-    route_id = as.numeric(route_id),
     total_length = as.numeric(st_length(geometry)),
     # Normalize distance to [0,1] fraction
     to_fraction = pmin(shape_dist_traveled / total_length, 1)
@@ -439,52 +438,63 @@ subset_spatialcongestion <- subset_clipped %>%
   ungroup()
 ```
 
-## ACS Weighted Demos by Segment
+### Quick Fix to Return Route_ID to DF (not needed anymore)
+```{r}
+subset_fixed <- subset_spatialcongestion %>%
+  left_join(trips %>% select(trip_id, route_id),
+            by = "trip_id") %>%
+  select(!route_id.x) %>%
+  rename("route_id" = "route_id.y") %>%
+  mutate(route_id = as.factor)
+```
+
+## ACS Weighted Demos by Route (segment too computationally-intensive)
 
 ### Custom Function
 ```{r}
 # Ridership
-get_weighted_acs <- function(geometry) {
-  buffered_route <- st_buffer(geometry, dist = 2640) # approximate 0.5 mile buffer (in feet)
+get_weighted_acs <- function(route_id) {
+   route_shape <- routes_subset %>%
+     filter(ROUTE_ID == route_id)
+  buffered_route <- st_buffer(route_shape, dist = 2640) # approximate 0.5 mile buffer (in feet)
   
   # Filter ACS polygons to include only ones with over 50% within buffer
-  blocks_filtered <- kcacs_blocks %>%
-    filter(lengths(st_intersects(., buffered_route)) > 0) %>%
-    rowwise() %>%
-    mutate(
-      inter_geom = list(st_intersection(geometry, buffered_route)),
-      inter_area = {
-        ig <- inter_geom[]
-        if(length(ig) == 0 || all(st_is_empty(ig))) {
-          0
-          } else {
-            sum(st_area(ig))
-            }
-        },
-      total_area = st_area(geometry),
-      overlap_ratio = as.numeric(inter_area / total_area)
-      ) %>%
-    ungroup() %>%
-    filter(overlap_ratio >= 0.5)
+   blocks_filtered <- kcacs_blocks %>%
+     filter(lengths(st_intersects(., buffered_route)) > 0) %>%
+     rowwise() %>%
+     mutate(
+       inter_geom = list(st_intersection(geometry, buffered_route)),
+       inter_area = {
+         ig <- inter_geom[]
+         if(length(ig) == 0 || all(st_is_empty(ig))) {
+           0
+           } else {
+             sum(st_area(ig))
+             }
+         },
+       total_area = st_area(geometry),
+       overlap_ratio = as.numeric(inter_area / total_area)
+       ) %>%
+     ungroup() %>%
+     filter(overlap_ratio >= 0.5)
   
   # Weighted average
   total_population <- sum(blocks_filtered$tot_popE)
+  total_buffer_area <- sum(st_area(blocks_filtered$geometry))
   
   blocks_filtered <- blocks_filtered %>%
-    mutate(wgt_popdens = pop_density * (tot_popE/total_population),
-           wgt_ridership = transp_mthd_public_perc * (tot_popE/total_population),
+    mutate(wgt_ridership = transp_mthd_public_perc * (tot_popE/total_population),
            wgt_percwhite = white_perc * (tot_popE/total_population),
            wgt_medHHI = median_HHI * (tot_popE/total_population))
   
   list(
-    pop_density = as.double(sum(blocks_filtered$wgt_popdens)),
+    pop_density = total_population/total_buffer_area,
     route_ridership = as.double(sum(blocks_filtered$wgt_ridership)),
     perc_white = as.double(sum(blocks_filtered$wgt_percwhite)),
     median_hhi = as.double(sum(blocks_filtered$wgt_medHHI))
   )
 }
 ```
-
 
 ### Loading ACS variables
 ```{r}
@@ -517,6 +527,7 @@ kcacs_blocks <- kingcounty_acs_blocks %>%
          pop_density = tot_popE / ALAND_miles,
          white_perc = race_whiteE / race_baseE,
          median_HHI = median_HHIE) %>%
+  filter(!is.na(median_HHI)) %>%
   select(tot_popE,
          pop_density,
          transp_mthd_public_perc,
@@ -528,11 +539,35 @@ kcacs_blocks <- kingcounty_acs_blocks %>%
 
 ### Rowwise Application
 ```{r}
-subset_withacs <- subset_spatialcongestion %>% 
-  rowwise() %>% 
-  mutate(results = list(get_weighted_acs(geometry))) %>%
-  unnest_wider(results) %>%
-  ungroup()
+route_demos <- routes_subset %>%
+  rowwise() %>%
+  mutate(
+     acs_data = list(get_weighted_acs(ROUTE_ID))
+   ) %>%
+  mutate(
+    pop_density = acs_data$pop_density, # POP PER SQUARE FOOT
+    route_ridership = acs_data$route_ridership,
+    perc_white = acs_data$perc_white,
+    median_hhi = acs_data$median_hhi
+  ) %>%
+  ungroup() %>%
+  select(!acs_data, !geometry) %>%
+  filter(!is.na(ROUTE_ID))
+
+route_demos <- route_demos %>%
+  select(ROUTE_ID, pop_density, route_ridership, perc_white, median_hhi) %>%
+  rename("route_id" = "ROUTE_ID") %>%
+  mutate(pop_density = as.double(pop_density),
+         route_id = as.factor(route_id))
+```
+
+### Join With Main
+```{r}
+subset_withacs <- subset_fixed %>%
+  select(!geometry) %>%
+  tibble() %>%
+  left_join(route_demos,
+            by = "route_id")
 ```
 
 # Final Dataset
@@ -589,6 +624,7 @@ data_final <- subset_standardized %>%
          trip_id, 
          rapid_ride, 
          arrival_delay, 
+         abs_dev,
          shape_dist_traveled, 
          avg_traffic_dayhour, 
          spatial_congestion,
@@ -620,10 +656,26 @@ data_final <- subset_standardized %>%
 write_csv(data_final, "../predictor_tables/final_data.csv")
 ```
 
+```{r}
+# Train/Test Split
+set.seed(50)
+
+# Train/Test Partition
+smp_size <- floor(0.5 * nrow(data_final))
+train_indices <- sample(seq_len(nrow(data_final)), size = smp_size)
+
+train <- data_final[train_indices, ]
+test <- data_final[-train_indices, ]
+
+write_csv(train, "../cloud-scripts/train_data.csv")
+write_csv(test, "../cloud-scripts/test_data.csv")
+```
+
+
 # Checking for NAs
 ```{r}
 # Arrival Times
-gtfs_arrival_NAs <- gtfs_main_final %>%
+gtfs_arrival_NAs <- train %>%
   filter(is.na(arrival_delay))
 
 if (nrow(gtfs_arrival_NAs) == 0) {

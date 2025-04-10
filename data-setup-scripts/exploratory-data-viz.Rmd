@@ -20,22 +20,26 @@ library(patchwork)
 library(ggridges)
 library(GGally)
 library(rstanarm)
+library(skimr)
+library(keyring)
+library(tidycensus)
 
 # GIS and Mapping
 library(sf)
 library(tmap) 
 ```
 
-# Loading Data MAKE SURE THAT RAPID_RIDE IS CODED CORRECTLY!!!
+# Loading Data
 ```{r}
 data <- read_csv(here("predictor_tables","final_data.csv")) %>%
   mutate(
-    g_route_id = as.factor(g_route_id), 
+    g_routeid = as.factor(g_routeid), 
     stop_id = as.factor(stop_id), 
     trip_id = as.factor(trip_id), 
     rapid_ride = as.numeric(rapid_ride), 
     arrival_delay = as.numeric(arrival_delay), 
     abs_dev = as.numeric(abs_dev),
+    log_abs_dev = log(abs_dev + 0.1),
     shape_dist_traveled = as.numeric(shape_dist_traveled), 
     avg_traffic_dayhour = as.numeric(avg_traffic_dayhour), 
     spatial_congestion = as.numeric(spatial_congestion),
@@ -47,7 +51,13 @@ data <- read_csv(here("predictor_tables","final_data.csv")) %>%
     g_hr = as.numeric(g_hr),
     g_peak = as.factor(g_peak),
     g_weekend = as.factor(g_weekend)
-  )
+  ) %>%
+  mutate(
+    abs_dev = ifelse(
+    abs_dev < 80000, abs_dev,
+    abs(abs_dev - 86400)
+    ))
+
 ```
 
 # Descriptive Stats
@@ -57,8 +67,7 @@ data <- read_csv(here("predictor_tables","final_data.csv")) %>%
 data_desc = data %>%
   select(
     rapid_ride, 
-    arrival_delay, 
-    abs_dev,
+    log_abs_dev,
     shape_dist_traveled, 
     avg_traffic_dayhour, 
     spatial_congestion,
@@ -70,33 +79,11 @@ data_desc = data %>%
     g_hr
   )
 
-desc_overall <- data %>%
-  summarize(across(everything()),
-    mean = mean,
-    stddev = sd,
-    min = min,
-    quartile_1 = ~quantile(., 0.25),
-    median = median,
-    quartile_3 = ~quantile(., 0.75),
-    max = max,
-  )
+overall_descriptives <- skim(data_desc)
+RR1_descriptives <- skim(data_desc %>% filter(rapid_ride == 1))
+RR0_descriptives <- skim(data_desc %>% filter(rapid_ride == 0))
 
-desc_groups <- data %>%
-  group_by(rapid_ride) %>%
-  summarize(across(everything()),
-    mean = mean,
-    stddev = sd,
-    min = min,
-    quartile_1 = ~quantile(., 0.25),
-    median = median,
-    quartile_3 = ~quantile(., 0.75),
-    max = max,
-  )
-
-desc_table <- rbind(desc_groups, desc_overall)
-
-# Need a prettier printing soluation
-desc_table
+# CAN USE KABLE W/ DIGITS ARGUMENT FOR BETTER PRINTING
 ```
 
 ## Assessing Balance for Causal Inference
@@ -159,7 +146,7 @@ y <- data_desc$rapid_ride
 # Running the function
 balance_table <- get_balance(rawdata = X, treat = y, estimand = "ATT")
 
-# Need a prettier printing soluation
+# Need a prettier printing solution (KABLE)
 balance_table
 ```
 
@@ -170,29 +157,27 @@ balance_table
 ### Routes + Stops in the City
 ```{r}
 # Loading Data
-routes_inscope <- unique(data$g_route_id)
+routes_inscope <- unique(data$g_routeid)
 stops_inscope <- unique(data$stop_id)
 routes_rapidride <- data %>%
   filter(rapid_ride == 1)
-routes_rapidride <- unique(routes_rapidride$g_route_id)
+routes_rapidride <- unique(routes_rapidride$g_routeid)
 
 routes_shp <- st_read(here("Predictor Data Sets",
                            "KCMetro_Transit_Lines",
                            "Transit_Routes_for_King_County_Metro___transitroute_line.shp")) %>%
-  filter(route_id %in% routes_inscope)
+  filter(ROUTE_ID %in% routes_inscope)
 
 routes_rapidride_shp <- routes_shp %>%
-  filter(route_id %in% routes_rapidride)
+  filter(ROUTE_ID %in% routes_rapidride)
 
 stops_shp <- st_read(here("Predictor Data Sets",
                           "KCMetro_Transit_Stops",
-                          "Transit_Stops_for_King_County_Metro___transitstop_point.shp")) %>%
-  filter(stop_id %in% stops_inscope)
+                          "Transit_Stops_for_King_County_Metro___transitstop_point.shp"))
 
 # Mapping
 routestop_map <- tm_shape(routes_shp) + tm_lines(col = "blue") +
-  tm_shape(routes_rapidride_shp) + tm_lines(col = "red") + 
-  tm_shape(stops_shp) + tm_dots(col = "yellow") +
+  tm_shape(routes_rapidride_shp) + tm_lines(col = "red") +
   tm_basemap("CartoDB.PositronNoLabels")
 
 routestop_map
@@ -208,7 +193,7 @@ congestion_spatial <- st_read(here("Predictor Data Sets",
   st_transform(crs = 2285)
 
 # Mapping
-traffic_map <- tm_shape(congestion_spatial) + tm_lines(col = AWDT) + 
+traffic_map <- tm_shape(congestion_spatial) + tm_lines(col = "AWDT", palette = "ylOrRd", style = "sd") + 
   tm_basemap("CartoDB.PositronNoLabels")
 
 traffic_map
@@ -274,14 +259,16 @@ popdensity_map + ridership_map + whiteperc_map + medianHHI_map
 
 ### Traffic: Average Traffic by Day+Hour
 ```{r}
-data_trafficdayhour <- desc_data %>%
-  select(avg_traffic_dayhour, g_weekday, g_hr)
+data_trafficdayhour <- data_desc %>%
+  select(avg_traffic_dayhour,g_weekday, g_hr)
 
 avgtraffic_plot <- ggplot(data = data_trafficdayhour,
                           aes(x = g_hr, 
                               y = avg_traffic_dayhour,
-                              color = g_weekday)) + 
-  geom_line(linetype = g_weekday)
+                              color = factor(g_weekday))) + 
+  geom_line(aes(linetype = factor(g_weekday)))
+
+avgtraffic_plot
 ```
 
 ### Graphs Per Predictor vs. Absolute Deviation
@@ -289,65 +276,74 @@ avgtraffic_plot <- ggplot(data = data_trafficdayhour,
 # shape_dist_traveled = as.numeric(shape_dist_traveled)
 disttraveled_plot <- ggplot(data = data,
                             aes(x = shape_dist_traveled,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # avg_traffic_dayhour = as.numeric(avg_traffic_dayhour)
 timetraffic_plot <- ggplot(data = data,
                             aes(x = avg_traffic_dayhour,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # spatial_congestion = as.numeric(spatial_congestion)
 spacetraffic_plot <- ggplot(data = data,
                             aes(x = spatial_congestion,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # pop_density = as.numeric(pop_density)
 popdensity_plot <- ggplot(data = data,
                             aes(x = pop_density,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # route_ridership = as.numeric(route_ridership)
 ridership_plot <- ggplot(data = data,
                             aes(x = route_ridership,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # perc_white = as.numeric(perc_white)
 percwhite_plot <- ggplot(data = data,
                             aes(x = perc_white,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # median_hhi = as.numeric(median_hhi)
 medianhhi_plot <- ggplot(data = data,
                             aes(x = median_hhi,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_point()
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_point(size = 0.5) + 
+  theme(legend.position = "none")
 
 # g_weekday = as.numeric(g_weekday)
 weekday_plot <- ggplot(data = data,
                             aes(x = g_weekday,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_jitter(width = 0.5)
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_jitter(width = 0.5, size = 0.5) + 
+  theme(legend.position = "none")
 
 # g_hr = as.numeric(g_hr)
 hour_plot <- ggplot(data = data,
                             aes(x = g_hr,
-                                y = abs_dev,
-                                color = rapid_ride)) +
-  geom_jitter(width = 0.5)
+                                y = log_abs_dev,
+                                color = factor(rapid_ride))) +
+  geom_jitter(width = 0.5, size = 0.5) + 
+  theme(legend.position = "none")
 
 (disttraveled_plot | timetraffic_plot | spacetraffic_plot) /
 (popdensity_plot | ridership_plot | percwhite_plot) /
@@ -358,7 +354,7 @@ hour_plot <- ggplot(data = data,
 
 ### RapidRide vs. Non-RapidRide
 ```{r}
-rapidride_stats <- table %>%
+rapidride_stats <- data %>%
   group_by(rapid_ride) %>%
   summarize(
     mean = mean(abs_dev, na.rm = TRUE),
@@ -366,7 +362,7 @@ rapidride_stats <- table %>%
     n = n()
     )
 
-ggplot(summary_stats, aes(x = rapid_ride, y = mean, color = rapid_ride)) +
+ggplot(rapidride_stats, aes(x = rapid_ride, y = mean, color = factor(rapid_ride))) +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
   labs(
@@ -381,8 +377,8 @@ ggplot(summary_stats, aes(x = rapid_ride, y = mean, color = rapid_ride)) +
 
 ### By Route
 ```{r}
-route_stats <- table %>%
-  group_by(route_id) %>%
+route_stats <- data %>%
+  group_by(g_routeid) %>%
   summarize(
     mean = mean(abs_dev, na.rm = TRUE),
     se = sd(abs_dev, na.rm = TRUE) / sqrt(n()),
@@ -390,7 +386,7 @@ route_stats <- table %>%
     rapid_ride = as.factor(rapid_ride)
     )
 
-ggplot(summary_stats, aes(x = route_id, y = mean, color = rapid_ride)) +
+ggplot(route_stats, aes(x = g_routeid, y = mean, color = rapid_ride)) +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
   labs(
