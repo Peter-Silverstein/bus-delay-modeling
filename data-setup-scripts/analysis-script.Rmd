@@ -29,18 +29,9 @@ library(bayesplot)
 
 # Loading Data
 ```{r}
-train_df <- read_csv(here("cloud-scripts","train_data.csv")) %>%
-  mutate(
-    abs_dev = ifelse(
-    abs_dev < 80000, abs_dev,
-    abs(abs_dev - 86400)
-    ))
-test_df <- read_csv(here("cloud-scripts","test_data.csv")) %>%
-  mutate(
-    abs_dev = ifelse(
-    abs_dev < 80000, abs_dev,
-    abs(abs_dev - 86400)
-    ))
+train_df <- read_csv(here("cloud-scripts","train_data.csv"))
+
+test_df <- read_csv(here("cloud-scripts","test_data.csv"))
 
 # Make sure all variables are in the correct format
 ```
@@ -50,13 +41,13 @@ test_df <- read_csv(here("cloud-scripts","test_data.csv")) %>%
 ## Single Binary Variable Comparison
 ```{r}
 # First, a simple comparison of means
-fit_binary <- stan_glm(log(abs_dev + 1) ~ rapid_ride,
+fit_binary <- stan_glm(abs_dev ~ rapid_ride,
                        data = train_df,
                        refresh = FALSE,
                        cores = 4)
 
 # Second, fit a model using simple linear terms for each covariate
-fit_multivariate <- stan_glm(log(abs_dev + 1) ~ rapid_ride + 
+fit_multivariate <- stan_glm(abs_dev ~ rapid_ride + 
                                shape_dist_traveled + 
                                avg_traffic_dayhour + 
                                spatial_congestion +
@@ -64,15 +55,14 @@ fit_multivariate <- stan_glm(log(abs_dev + 1) ~ rapid_ride +
                                route_ridership + 
                                perc_white + 
                                median_hhi + 
-                               g_weekday + 
-                               g_hr,
+                               factor(g_weekday) + 
+                               factor(g_hr),
                        data = train_df,
                        refresh = FALSE,
                        cores = 4)
 
 # Third, fit a model with interactions between related variables and allow treatment effects to vary by group
-fit_int <- stan_glm(log(abs_dev + 1) ~ rapid_ride + 
-                         rapid_ride + 
+fit_int <- stan_glm(abs_dev ~ rapid_ride + 
                          shape_dist_traveled + 
                          avg_traffic_dayhour + 
                          spatial_congestion +
@@ -83,8 +73,8 @@ fit_int <- stan_glm(log(abs_dev + 1) ~ rapid_ride +
                          spatial_congestion:avg_traffic_dayhour + 
                          shape_dist_traveled:avg_traffic_dayhour + 
                          shape_dist_traveled:spatial_congestion + 
-                         rapid_ride:g_peak + 
-                         rapid_ride:g_weekend +
+                         rapid_ride:factor(g_weekday) +
+                         rapid_ride:factor(g_hr) + 
                          rapid_ride:spatial_congestion + 
                          rapid_ride:route_ridership + 
                          rapid_ride:avg_traffic_dayhour,
@@ -101,7 +91,7 @@ print(fit_int, digits = 5)
 
 ```{r}
 # Validate models on Test Set, compute RMSE (GIVING NEGATIVE NUMBERS!!)
-actuals <- log(test_df$abs_dev + 1)
+actuals <- test_df$abs_dev
 
 binary_pred <- predict(fit_binary, newdata = test_df)
 multivariate_pred <- predict(fit_multivariate, newdata = test_df)
@@ -165,6 +155,101 @@ print(paste("SATT :", satt_est_int, "Confidence Interval:", satt_ci_int[1], satt
 
 ```{r}
 # Calculate SATT by groupings
+# Day first
+n_groups <- 7
+daily_codes <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+daily_means <- rep(NA, n_groups)
+daily_upper <- rep(NA, n_groups)
+daily_lower <- rep(NA, n_groups)
+n_draws <- 1000
+
+
+for (day in 1:n_groups) {
+  daytreated_df <- treated_df %>% filter(g_weekday == day)
+  daycounter_df <- daytreated_df
+  daycounter_df$rapid_ride <- 0
+  
+  y1_pred_day <- posterior_epred(fit_int, newdata = daytreated_df)
+  y0_pred_day <- posterior_epred(fit_int, newdata = daycounter_df)
+  ind_effects_day <- y1_pred_day - y0_pred_day
+  satt_dist_day <- rowMeans(ind_effects_day)
+  
+  satt_est_day <- median(satt_dist_day)
+  satt_ci_upper <- quantile(satt_dist_day, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_day, probs = c(0.025))
+  
+  daily_means[day] <- satt_est_day
+  daily_upper[day] <- satt_ci_upper
+  daily_lower[day] <- satt_ci_lower
+}
+
+daily_ests <- tibble(daily_codes, daily_means, daily_upper, daily_lower)
+daily_ests
+```
+
+```{r}
+# Calculate SATT by groupings
+# Day first
+n_groups <- 24
+hr_codes <- seq(from = 1, to = 24)
+hr_means <- rep(NA, n_groups)
+hr_upper <- rep(NA, n_groups)
+hr_lower <- rep(NA, n_groups)
+n_draws <- 1000
+
+
+for (hr in 1:n_groups) {
+  hrtreated_df <- treated_df %>% filter(g_hr == hr)
+  
+  if (nrow(hrtreated_df > 0)) {
+    hrcounter_df <- hrtreated_df
+    hrcounter_df$rapid_ride <- 0
+  
+    y1_pred_hr <- posterior_epred(fit_int, newdata = hrtreated_df)
+    y0_pred_hr <- posterior_epred(fit_int, newdata = hrcounter_df)
+    ind_effects_hr <- y1_pred_hr - y0_pred_hr
+    satt_dist_hr <- rowMeans(ind_effects_hr)
+  
+    satt_est_hr <- median(satt_dist_hr)
+    satt_ci_upper <- quantile(satt_dist_hr, probs = c(0.975))
+    satt_ci_lower <- quantile(satt_dist_hr, probs = c(0.025))
+  
+    hr_means[hr] <- satt_est_hr
+    hr_upper[hr] <- satt_ci_upper
+    hr_lower[hr] <- satt_ci_lower
+  }
+  else {
+    hr_means[hr] <- 0
+    hr_upper[hr] <- 0
+    hr_lower[hr] <- 0
+  }
+}
+
+hr_ests <- tibble(hr_codes, hr_means, hr_upper, hr_lower)
+hr_ests
+```
+
+# Le Test Graph
+```{r}
+hourly_graph <- ggplot(data=hr_ests) +
+  geom_point(aes(x=hr_codes, y=hr_means,
+                    color = "Non-MLM Model")) +
+  geom_errorbar(aes(ymin=hr_lower,
+                    ymax=hr_upper,
+                    x=hr_codes,
+                    color = "Non-MLM Model"), alpha=.5, width = 0) +
+  scale_color_manual(name="Legend", 
+                    values=c("Non-MLM Model"="blue")) +
+  coord_cartesian(ylim=c(min(hr_lower - 10), max(hr_upper + 10))) +
+  theme_bw()+
+  labs(x="Hour of the Day",y="Estimated Treatment Effect of RapidRide, in seconds")+
+  theme(axis.title=element_text(size=10),
+        axis.text.y=element_text(size=10),
+        axis.text.x=element_text(angle=90,size=8, vjust=0.3),
+        legend.title=element_text(size=10),
+        legend.text=element_text(size=10))
+
+hourly_graph
 ```
 
 # Hierarchical BART Model (via stan4bart)
@@ -178,16 +263,11 @@ fit_stan4bart <- load(here("cloud-scripts","stan4bart_rapidride_model.RData"))
 # Validate on Test Set, compute RMSE (use predict)
 # Examine the options within predict(): 
     # "ev" - Expected value (default)
-    # "ppd" - Posterior predictive distribution <- use to get comparable output to posterior_predict()
-    # "indiv.fixef" - Individual fixed effects
-    # "indiv.ranef" - Individual random effects
-    # "indiv.bart" - Individual BART component
 ```
 
 ## Counterfactual Estimations
 ```{r}
-# If we've validated the model, I think it's ok to just do this on the training set
-# Another/secondary approach could be to create a fake dataset with test data and compare (simulation!)
+
 ```
 
 # Results Visualization

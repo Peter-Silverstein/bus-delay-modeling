@@ -660,6 +660,13 @@ write_csv(data_final, "../predictor_tables/final_data.csv")
 # Train/Test Split
 set.seed(50)
 
+data_final <- read_csv("../predictor_tables/final_data.csv") %>%
+  mutate(
+    abs_dev = ifelse(
+    abs_dev < 80000, abs_dev,
+    abs(abs_dev - 86400)
+    ))
+
 # Train/Test Partition
 smp_size <- floor(0.5 * nrow(data_final))
 train_indices <- sample(seq_len(nrow(data_final)), size = smp_size)

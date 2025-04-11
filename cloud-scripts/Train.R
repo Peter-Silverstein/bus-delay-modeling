@@ -11,7 +11,7 @@ model_dir <- Sys.getenv("AIP_MODEL_DIR", "")
 df <- read_csv("train_data.csv")
 
 # Training the stan4bart model *****MAKE SURE TO FINALIZE THIS DESIGN*****
-fit <- stan4bart(log(abs_dev + 1) ~ bart(.-g_weekday-g_hr-g_weekend-g_peak) + rapid_ride + (1 + rapid_ride | g_weekday/g_hr),
+fit <- stan4bart(abs_dev ~ bart(.-g_hr-g_weekday) + rapid_ride + (1 + rapid_ride | g_hr) + (1 + rapid_ride | g_weekday),
                    data = df,
                    treatment = rapid_ride,
                    cores = 4,
