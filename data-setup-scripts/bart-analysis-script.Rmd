@@ -1,0 +1,368 @@
+---
+title: "bart-analysis-script"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(patchwork)
+library(modelsummary)
+library(knitr)
+
+# Modeling
+library(stan4bart)
+library(bartCause)
+library(rstanarm)
+library(bayesplot)
+
+# Loading output from stan4bart model trained via Google Cloud
+load("../predictor_tables/models-stan4bart_rapidride_outputs_ppd.RData")
+
+train_df <- read_csv(here("cloud-scripts","stan4bart","train_data.csv"))
+test_df <- read_csv(here("cloud-scripts","stan4bart","test_data.csv"))
+```
+
+# Check Convergence
+```{r}
+# Plot Chain 1 (all iterations)
+plot(stan4bart_sigma, type = "l", col = "blue",
+     main = "σ Posterior Samples",
+     xlab = "Iteration", ylab = "σ")
+```
+
+# RMSE
+```{r}
+# Validate models on Test Set, compute RMS
+actuals <- test_df$abs_dev
+
+bart_rmse <- sqrt(mean((outofsample_test - actuals)^2))
+
+bart_rmse_df <- tibble(
+  Model = c("Hierarchical BART"),
+  RMSE = c(bart_rmse)
+)
+
+kable(bart_rmse_df)
+```
+
+# PPC Overlay
+```{r}
+n_draws <- 100
+draws <- sample(1:4000, n_draws)
+filtered_factual <- factual_predictions[, draws]
+factual_predictions_t <- t(filtered_factual)
+ppc_dens_overlay(actuals, factual_predictions_t)
+```
+
+# PPC Overlay
+```{r}
+n_draws <- 100
+treat <- factual_predictions[, sample(ncol(factual_predictions), n_draws)]  # Columns = draws
+cf <- counterfactual_predictions[, sample(ncol(counterfactual_predictions), n_draws)]
+
+combined_data <- bind_rows(
+  as.data.frame(treat) %>%
+    mutate(obs_id = row_number()) %>%          # Preserve observation IDs
+    pivot_longer(-obs_id, names_to = "draw"),  # Convert to long format
+  as.data.frame(cf) %>%
+    mutate(obs_id = row_number()) %>%
+    pivot_longer(-obs_id, names_to = "draw")
+) %>%
+  mutate(source = rep(c("treat", "cf"), 
+                    each = nrow(.)/2))  
+
+ggplot(combined_data, aes(x = value, group = interaction(draw, source))) +
+  geom_density(aes(color = source), linewidth = 0.3, alpha = 0.4) +
+  stat_density(aes(x = value, color = source), geom = "line", 
+               position = "identity", inherit.aes = FALSE,  # Global density
+               linewidth = 1.2, linetype = "dashed") +
+  labs(title = "PPC Distribution Comparison",
+       subtitle = "Thin lines=Individual draws | Dashed=Aggregate density",
+       x = "Predicted Value", 
+       color = "Model") +
+  theme_minimal() +
+  scale_color_manual(values = c("#E69F00", "#56B4E9"))
+```
+
+# SATT Overall
+```{r}
+# Calculate SATT
+
+# Getting vector of treated units from train_df
+treatment_vector <- train_df$rapid_ride
+
+# Filtering model extractions to only include rapidride indices
+rr_treat_pred <- factual_predictions[treatment_vector == 1, ]
+rr_cf_pred <- counterfactual_predictions[treatment_vector == 1, ]
+
+# Individual Effects
+ind_effects_bart <- rr_treat_pred - rr_cf_pred
+
+# Posterior Distribution of SATT
+satt_dist_bart <- colMeans(ind_effects_bart)
+
+# Summary Stats
+satt_est_bart <- median(satt_dist_bart)
+satt_upper <- satt_est_bart + 1.96*sd(satt_dist_bart)
+satt_lower <- satt_est_bart - 1.96*sd(satt_dist_bart)
+
+print(paste("SATT :", satt_est_bart, "Confidence Interval:", satt_lower, satt_upper), digits = 4)
+```
+
+# Day-Level SATT
+```{r}
+# Calculate SATT by groupings
+# Day first
+n_groups <- 7
+daily_codes <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+daily_means <- rep(NA, n_groups)
+daily_upper <- rep(NA, n_groups)
+daily_lower <- rep(NA, n_groups)
+
+for (day in 1:n_groups) {
+  indices <- train_df$g_weekday[train_df$rapid_ride == 1]
+  y1_pred_day <- rr_treat_pred[indices == day, ]
+  y0_pred_day <- rr_cf_pred[indices == day, ]
+  
+  ind_effects_day <- y1_pred_day - y0_pred_day
+  satt_dist_day <- rowMeans(ind_effects_day)
+  
+  satt_est_day <- median(satt_dist_day)
+  satt_ci_upper <- quantile(satt_dist_day, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_day, probs = c(0.025))
+  
+  daily_means[day] <- satt_est_day
+  daily_upper[day] <- satt_ci_upper
+  daily_lower[day] <- satt_ci_lower
+}
+
+daily_ests <- tibble(daily_codes, daily_means, daily_upper, daily_lower)
+daily_ests
+```
+
+# Hour-Level SATT
+```{r}
+# Calculate SATT by groupings
+# Day first
+n_groups <- 24
+hr_codes <- seq(from = 1, to = 24)
+hr_means <- rep(NA, n_groups)
+hr_upper <- rep(NA, n_groups)
+hr_lower <- rep(NA, n_groups)
+
+for (hr in 1:n_groups) {
+  indices <- train_df$g_hr[train_df$rapid_ride == 1]
+    
+  y1_pred_hr <- rr_treat_pred[indices == hr, ]
+  y0_pred_hr <- rr_cf_pred[indices == hr, ]
+  
+  if (nrow(y1_pred_hr) > 0) {
+  
+  ind_effects_hr <- y1_pred_hr - y0_pred_hr
+  satt_dist_hr <- rowMeans(ind_effects_hr)
+  
+  satt_est_hr <- median(satt_dist_hr)
+  satt_ci_upper <- quantile(satt_dist_hr, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_hr, probs = c(0.025))
+  
+  hr_means[hr] <- satt_est_hr
+  hr_upper[hr] <- satt_ci_upper
+  hr_lower[hr] <- satt_ci_lower
+  }
+  else {
+    hr_means[hr] <- 0
+    hr_upper[hr] <- 0
+    hr_lower[hr] <- 0
+  }
+}
+
+hr_ests <- tibble(hr_codes, hr_means, hr_upper, hr_lower)
+hr_ests
+```
+
+# Route-Level SATT
+```{r}
+# Pull RapidRide Route IDs
+RR_shortnames <- c("C Line", "D Line", "G Line")
+routes <- read_csv("../Predictor Data Sets/gtfs-static-files/routes.txt") %>%
+  select(route_id, route_short_name) %>%
+  filter(route_short_name %in% RR_shortnames)
+route_ids <- routes$route_id
+
+
+# Calculate SATT by groupings
+# Day first
+n_groups <- length(route_ids)
+route_means <- rep(NA, n_groups)
+route_upper <- rep(NA, n_groups)
+route_lower <- rep(NA, n_groups)
+
+for (r in 1:n_groups) {
+  route_id <- route_ids[r]
+  indices <- train_df$g_routeid[train_df$rapid_ride == 1] 
+  
+  y1_pred_route <- rr_treat_pred[indices == route_id, ]
+  y0_pred_route <- rr_cf_pred[indices == route_id, ]
+  
+  print(nrow(y1_pred_route))
+  
+  ind_effects_route <- y1_pred_route - y0_pred_route
+  satt_dist_route <- rowMeans(ind_effects_route)
+  
+  satt_est_route <- median(satt_dist_route)
+  satt_ci_upper <- quantile(satt_dist_route, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_route, probs = c(0.025))
+  
+  route_means[r] <- satt_est_route
+  route_upper[r] <- satt_ci_upper
+  route_lower[r] <- satt_ci_lower
+}
+
+route_ests <- tibble(route_ids, route_means, route_upper, route_lower)
+route_ests
+```
+
+# SATT: Hour + Day
+```{r}
+# Calculate SATT by groupings
+# Day first
+n_groups <- 7 * 24
+day_codes <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+day_numcodes <- seq(from = 1, to = 7, by = 1)
+hour_codes <- seq(from = 1, to = 24, by = 1)
+days <- rep(day_codes, 24)
+days_num <- rep(day_numcodes, 24)
+hours <- rep(hour_codes, 7)
+means <- rep(NA, n_groups)
+upper <- rep(NA, n_groups)
+lower <- rep(NA, n_groups)
+
+for (i in 1:n_groups) {
+  day <- days_num[i]
+  hour <- hours[i]
+  day_indices <- train_df$g_weekday[train_df$rapid_ride == 1]
+  hour_indices <- train_df$g_hr[train_df$rapid_ride == 1]
+  y1_pred <- rr_treat_pred[(day_indices == day & hour_indices == hour), , drop = FALSE]
+  y0_pred <- rr_cf_pred[(day_indices == day & hour_indices == hour), , drop = FALSE]
+  
+  if (nrow(y1_pred) > 0) {
+    
+  ind_effects <- y1_pred - y0_pred
+  satt_dist <- rowMeans(ind_effects)
+  
+  satt_est <- median(satt_dist)
+  satt_ci_upper <- quantile(satt_dist, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist, probs = c(0.025))
+  
+  means[i] <- satt_est
+  upper[i] <- satt_ci_upper
+  lower[i] <- satt_ci_lower
+  }
+  else {
+    means[i] <- 0
+    upper[i] <- 0
+    lower[i] <- 0
+  }
+}
+
+dayhour_ests <- tibble(days, hours, means, upper, lower) %>% arrange(hours)
+dayhour_ests
+```
+
+# Peak-Level SATT
+```{r}
+# Calculate SATT by groupings
+n_groups <- 2
+peak_codes <- seq(from = 0, to = 1)
+peak_means <- rep(NA, n_groups)
+peak_upper <- rep(NA, n_groups)
+peak_lower <- rep(NA, n_groups)
+
+for (p in 1:n_groups) {
+  indices <- train_df$g_peak[train_df$rapid_ride == 1]
+    
+  y1_pred_peak <- rr_treat_pred[indices == p-1, ]
+  y0_pred_peak <- rr_cf_pred[indices == p-1, ]
+  
+  ind_effects_peak <- y1_pred_peak - y0_pred_peak
+  satt_dist_peak <- rowMeans(ind_effects_peak)
+  
+  satt_est_peak <- median(satt_dist_peak)
+  satt_ci_upper <- quantile(satt_dist_peak, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_peak, probs = c(0.025))
+  
+  peak_means[p] <- satt_est_peak
+  peak_upper[p] <- satt_ci_upper
+  peak_lower[p] <- satt_ci_lower
+}
+
+peak_ests <- tibble(peak_codes, peak_means, peak_upper, peak_lower)
+peak_ests
+```
+
+# Graph: Hourly
+```{r}
+hourly_graph <- ggplot(data=hr_ests) +
+  geom_point(aes(x=hr_codes, y=hr_means,
+                    color = "BART Model")) +
+  geom_errorbar(aes(ymin=hr_lower,
+                    ymax=hr_upper,
+                    x=hr_codes,
+                    color = "BART Model"), alpha=.5, width = 0) +
+  scale_color_manual(name="Legend", 
+                    values=c("BART Model"="blue")) +
+  coord_cartesian(ylim=c(min(hr_lower - 10), max(hr_upper + 10))) +
+  theme_bw()+
+  labs(x="Hour of the Day",y="Estimated Treatment Effect of RapidRide, in seconds")+
+  theme(axis.title=element_text(size=10),
+        axis.text.y=element_text(size=10),
+        axis.text.x=element_text(angle=90,size=8, vjust=0.3),
+        legend.title=element_text(size=10),
+        legend.text=element_text(size=10))
+
+hourly_graph
+```
+
+# Graph: Day Hour
+```{r}
+dayhour_graph <- ggplot(data=dayhour_ests) +
+  geom_point(aes(x=hours, y=means,
+                    color = days)) +
+  geom_errorbar(aes(ymin=lower,
+                    ymax=upper,
+                    x=hours,
+                    color = days), alpha=.5, width = 0) +
+  coord_cartesian(ylim=c(min(lower - 10), max(upper + 10))) +
+  theme_bw()+
+  labs(x="Hour of the Day",y="Estimated Treatment Effect of RapidRide, in seconds")+
+  theme(axis.title=element_text(size=10),
+        axis.text.y=element_text(size=10),
+        axis.text.x=element_text(angle=90,size=8, vjust=0.3),
+        legend.title=element_text(size=10),
+        legend.text=element_text(size=10))
+
+dayhour_graph
+```
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,200 @@
+---
+title: "vanillabart-analysis-script"
+author: "Peter Silverstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+# Loading Libraries
+
+# General Use
+library(tidyverse)
+library(ggplot2)
+library(here)
+library(patchwork)
+library(modelsummary)
+library(knitr)
+
+# Modeling
+library(stan4bart)
+library(bartCause)
+library(rstanarm)
+library(bayesplot)
+
+# Loading output from stan4bart model trained via Google Cloud
+load("../predictor_tables/models-vanillabart_rapidride_model.RData")
+load("../predictor_tables/models-vanillabart_rapidride_outputs_ppd.RData")
+
+train_df <- read_csv(here("cloud-scripts","partial-pooling","train_data.csv"))
+test_df <- read_csv(here("cloud-scripts","partial-pooling","test_data.csv"))
+```
+
+# Check Convergence
+```{r}
+# Plot Chain 1 (all iterations)
+plot(fit$sigma[1,], type = "l", col = "blue",
+     main = "σ Posterior Samples by Chain",
+     xlab = "Iteration", ylab = "σ")
+
+# Overlay other chains with lines()
+lines(fit$sigma[2,], col = "yellow")
+lines(fit$sigma[3,], col = "red")
+lines(fit$sigma[4,], col = "green")
+
+# Add legend
+legend("topright",
+       legend = paste("Chain", 1:4),
+       col = c("blue", "yellow", "red", "green"),
+       lty = 1)
+```
+
+# RMSE
+```{r}
+# Validate models on Test Set, compute RMSE
+outofsample_means <- colMeans(outofsample_test)
+
+actuals <- test_df$abs_dev
+
+vanilla_bart_rmse <- sqrt(mean((outofsample_means - actuals)^2))
+
+vanilla_bart_rmse_df <- tibble(
+  Model = c("Vanilla BART"),
+  RMSE = c(vanilla_bart_rmse)
+)
+
+kable(vanilla_bart_rmse_df)
+```
+
+# PPC Overlay
+```{r}
+ppd_pred <- predict(fit, newdata = test_df, type = "ppd")
+n_draws <- 100
+draws <- sample(1:2000, n_draws)
+filtered_factual <- ppc_pred[draws, ]
+ppc_dens_overlay(actuals, filtered_factual)
+```
+
+# SATT
+```{r}
+# Individual Effects
+ind_effects_bart <- vanillabart_factual_pred - vanillabart_counterfactual_pred
+
+# Posterior Distribution of SATT
+satt_dist_bart <- rowMeans(ind_effects_bart)
+
+# Summary Stats
+satt_est_bart <- median(satt_dist_bart)
+satt_upper <- satt_est_bart + 1.96*sd(satt_dist_bart)
+satt_lower <- satt_est_bart - 1.96*sd(satt_dist_bart)
+
+print(paste("SATT :", satt_est_bart, "Confidence Interval:", satt_lower, satt_upper), digits = 4)
+```
+
+# PPC Overlay
+```{r}
+n_draws <- 100
+treat <- vanillabart_factual_pred[, sample(ncol(vanillabart_factual_pred), n_draws)]  # Columns = draws
+cf <- vanillabart_counterfactual_pred[, sample(ncol(vanillabart_counterfactual_pred), n_draws)]
+
+combined_data <- bind_rows(
+  as.data.frame(treat) %>%
+    mutate(obs_id = row_number()) %>%          # Preserve observation IDs
+    pivot_longer(-obs_id, names_to = "draw"),  # Convert to long format
+  as.data.frame(cf) %>%
+    mutate(obs_id = row_number()) %>%
+    pivot_longer(-obs_id, names_to = "draw")
+) %>%
+  mutate(source = rep(c("treat", "cf"), 
+                    each = nrow(.)/2))  
+
+ggplot(combined_data, aes(x = value, group = interaction(draw, source))) +
+  geom_density(aes(color = source), linewidth = 0.3, alpha = 0.4) +
+  stat_density(aes(x = value, color = source), geom = "line", 
+               position = "identity", inherit.aes = FALSE,  # Global density
+               linewidth = 1.2, linetype = "dashed") +
+  labs(title = "PPC Distribution Comparison",
+       subtitle = "Thin lines=Individual draws | Dashed=Aggregate density",
+       x = "Predicted Value", 
+       color = "Model") +
+  theme_minimal() +
+  scale_color_manual(values = c("#E69F00", "#56B4E9"))
+```
+
+# Day-Level SATT
+```{r}
+# Calculate SATT by groupings
+# Day first
+vb_fact_t <- t(vanillabart_factual_pred)
+vb_counterfact_t <- t(vanillabart_counterfactual_pred)
+
+n_groups <- 7
+daily_codes <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+daily_means <- rep(NA, n_groups)
+daily_upper <- rep(NA, n_groups)
+daily_lower <- rep(NA, n_groups)
+
+for (day in 1:n_groups) {
+  indices <- train_df$g_weekday[train_df$rapid_ride == 1]
+  y1_pred_day <- vb_fact_t[indices == day, ]
+  y0_pred_day <- vb_counterfact_t[indices == day, ]
+  
+  ind_effects_day <- y1_pred_day - y0_pred_day
+  satt_dist_day <- colMeans(ind_effects_day)
+  
+  satt_est_day <- median(satt_dist_day)
+  satt_ci_upper <- quantile(satt_dist_day, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_day, probs = c(0.025))
+  
+  daily_means[day] <- satt_est_day
+  daily_upper[day] <- satt_ci_upper
+  daily_lower[day] <- satt_ci_lower
+}
+
+daily_ests <- tibble(daily_codes, daily_means, daily_upper, daily_lower)
+daily_ests
+```
+
+# Hour-Level SATT
+```{r}
+# Calculate SATT by groupings
+# Day first
+n_groups <- 24
+hr_codes <- seq(from = 1, to = 24)
+hr_means <- rep(NA, n_groups)
+hr_upper <- rep(NA, n_groups)
+hr_lower <- rep(NA, n_groups)
+
+for (hr in 1:n_groups) {
+  indices <- train_df$g_hr[train_df$rapid_ride == 1]
+    
+  y1_pred_hr <- vb_fact_t[indices == hr, ]
+  y0_pred_hr <- vb_counterfact_t[indices == hr, ]
+  
+  if (nrow(y1_pred_hr) > 0) {
+  
+  ind_effects_hr <- y1_pred_hr - y0_pred_hr
+  satt_dist_hr <- colMeans(ind_effects_hr)
+  
+  satt_est_hr <- median(satt_dist_hr)
+  satt_ci_upper <- quantile(satt_dist_hr, probs = c(0.975))
+  satt_ci_lower <- quantile(satt_dist_hr, probs = c(0.025))
+  
+  hr_means[hr] <- satt_est_hr
+  hr_upper[hr] <- satt_ci_upper
+  hr_lower[hr] <- satt_ci_lower
+  }
+  else {
+    hr_means[hr] <- 0
+    hr_upper[hr] <- 0
+    hr_lower[hr] <- 0
+  }
+}
+
+hr_ests <- tibble(hr_codes, hr_means, hr_upper, hr_lower)
+hr_ests
+```

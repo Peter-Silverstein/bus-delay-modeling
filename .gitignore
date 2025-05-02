@@ -1,11 +1,16 @@
 # datafiles
 /Geo Files/
+/models/
 /Predictor Data Sets/
+/predictor_tables/
 /raw_aws_alreadyloaded/
 /raw_from_awsS3/
 /sea-gtfs-proj/
 /predictor_tables/
 /thesis-assignments/
+/.venv/
+/.Rproj.user/
+/.git/
 
 # History files
 .Rhistory

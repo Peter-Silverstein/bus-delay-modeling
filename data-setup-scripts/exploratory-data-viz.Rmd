@@ -170,17 +170,45 @@ routes_shp <- st_read(here("Predictor Data Sets",
 
 routes_rapidride_shp <- routes_shp %>%
   filter(ROUTE_ID %in% routes_rapidride)
+routes_rapidride_shp$route_name <- c("C Line", "D Line", "G Line")
+
+c_line <- routes_rapidride_shp[1, ]
+d_line <- routes_rapidride_shp[2, ]
+g_line <- routes_rapidride_shp[3, ]
 
 stops_shp <- st_read(here("Predictor Data Sets",
                           "KCMetro_Transit_Stops",
                           "Transit_Stops_for_King_County_Metro___transitstop_point.shp"))
 
+# Get current bounding box and calculate ranges
+bbox_new <- st_bbox(routes_shp)
+xrange <- bbox_new["xmax"] - bbox_new["xmin"]
+yrange <- bbox_new["ymax"] - bbox_new["ymin"]
+
+# Extend bounding box in all directions by 10%
+bbox_new["xmin"] <- bbox_new["xmin"] - (0.2 * xrange)
+bbox_new["xmax"] <- bbox_new["xmax"] + (0.2 * xrange)
+bbox_new["ymin"] <- bbox_new["ymin"] - (0.0 * yrange)
+bbox_new["ymax"] <- bbox_new["ymax"] + (0.0 * yrange)
+
+# Convert to sf polygon
+bbox_new <- st_as_sfc(bbox_new)
+
 # Mapping
-routestop_map <- tm_shape(routes_shp) + tm_lines(col = "blue") +
-  tm_shape(routes_rapidride_shp) + tm_lines(col = "red") +
-  tm_basemap("CartoDB.PositronNoLabels")
+routestop_map <- tm_shape(routes_shp, bbox = bbox_new) + tm_lines(col = "#1D7D7A", lwd = 2) +
+  tm_shape(routes_rapidride_shp) + tm_lines(col = "#D71D24", lwd = 4) +
+  # tm_shape(g_line) + tm_lines(col = "#0061A7", lwd = 4) + 
+  # tm_shape(c_line) + tm_lines(col = "#D71921", lwd = 4) + 
+  # tm_shape(d_line) + tm_lines(col = "#006C3B", lwd = 4) + 
+  tm_basemap("CartoDB.PositronNoLabels") + 
+  tm_layout(
+    frame = TRUE,  # Add frame around map
+    outer.margins = c(0.05, 0.05, 0.05, 0.05)  # Adjust margins for better spacing
+  )
 
 routestop_map
+
+tmap_save(routestop_map, filename = "rapidridemap.png")
 ```
 
 ### Traffic in the City
