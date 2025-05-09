@@ -11,6 +11,14 @@
 /.venv/
 /.Rproj.user/
 /.git/
+corrplot.png
+route-map.png
+references.bib
+apa.csl
+thesis-draft-1.log
+thesis-draft-1.tex
+thesis-draft-2.pdf
+thesis-draft-3.pdf
 
 # History files
 .Rhistory
